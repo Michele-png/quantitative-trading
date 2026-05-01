@@ -63,10 +63,12 @@ dmypy.json
 .DS_Store
 
 # Project data caches — large, regenerable, should never be committed
-data/
-!data/.gitkeep
-output/
-logs/
+# (anchored to top-level /data/ only; src/quantitative_trading/data/ and
+#  tests/data/ are source code and MUST be tracked)
+/data/
+!/data/.gitkeep
+/output/
+/logs/
 
 # Notebook outputs in source notebooks (we strip them; reports keep them)
 notebooks/*.ipynb

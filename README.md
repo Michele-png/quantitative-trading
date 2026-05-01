@@ -10,6 +10,15 @@ The agent implements [Phil Town's Rule One](https://www.ruleoneinvesting.com/) f
 - **`src/quantitative_trading/data/`** — point-in-time data layer. SEC EDGAR client (filings as filed, not as later restated), yfinance wrapper with strict PIT cutoff, historical S&P 500 constituents.
 - **`src/quantitative_trading/dataset/`** — historical dataset builder. For each `(ticker, trade_date)` pair, runs the agent and computes a forward 5-year CAGR label.
 - **`src/quantitative_trading/backtest/`** — backtest engine and ablation framework. Compares full-Rule-One vs. quant-only vs. random-qualitative variants on classification metrics and portfolio simulation.
+- **`src/quantitative_trading/investors/`** — value-investor 13F audit toolkit. Downloads SEC 13F-HR filings for a curated list of value-oriented institutional managers (Munger/DJCO, Pabrai, Li Lu, Akre, Spier, Nygren/Harris, Russo, Berkowitz, Weitz, Greenberg), detects first-ever new positions, resolves CUSIPs, and scores each buy against the Rule One bar at the time of purchase. See **[`docs/REPORT.md`](docs/REPORT.md)** for the full academic report and **[`notebooks/reports/investor_criteria_audit.ipynb`](notebooks/reports/investor_criteria_audit.ipynb)** for interactive exploration.
+
+## Headline finding from the value-investor audit
+
+> Of 66 evaluable new positions opened by 10 value-oriented 13F filers in 2017–2024, **0** satisfied Phil Town's strict 7-criteria bar. But all 7 criteria show positive elite-vs-control premium — 3 are statistically significant after BH-FDR correction (EPS growth +22.6 pp, MoS +13.5 pp, Sales growth +15.6 pp). Within elite picks, criterion-pass count does NOT predict realized return (KM log-rank p=0.58). **Top-tier value investors use the criteria as soft preferences, not hard pass/fail gates.** Town's bar is over-strict relative to actual elite practice.
+
+See [`docs/REPORT.md`](docs/REPORT.md) for the full design, methodology (CMH + BH-FDR + Kaplan-Meier), results, and limitations (§13 caveats).
+
+![Per-criterion pass rate -- elite buys vs sector/date-matched controls](docs/figures/04_per_criterion_pass_rates.png)
 
 ## Quick start
 
@@ -34,6 +43,12 @@ python scripts/build_dataset.py --start 2012Q1 --end 2021Q1 --universe sp500
 
 # 6. Run the backtest with ablation
 python scripts/run_backtest.py
+
+# 7. (Optional) Run the value-investor audit pipeline
+#    (~12 min cold cache, ~5 min warm; produces data/investors/*.csv)
+python -m scripts.build_investor_purchases
+python -m scripts.run_investor_audit          # prints all section 7 statistical analyses
+python -m scripts.generate_audit_figures      # writes 8 PNGs to docs/figures/
 ```
 
 ## Methodology
