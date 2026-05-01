@@ -33,6 +33,9 @@ jobs:
       INITIAL_BUDGET_EUR: ${{ vars.INITIAL_BUDGET_EUR }}
       EUR_USD_RATE_SOURCE: polygon
       ITALY_CAPITAL_GAINS_TAX_RATE: "0.26"
+      MAX_CANDIDATES_FOR_LLM: ${{ vars.MAX_CANDIDATES_FOR_LLM || '5' }}
+      PRESELECT_COUNT: ${{ vars.PRESELECT_COUNT || '5' }}
+      RESERVE_CASH_USD: ${{ vars.RESERVE_CASH_USD || '5.0' }}
       DATA_DIR: data
     steps:
       - uses: actions/checkout@v4
