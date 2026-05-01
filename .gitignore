@@ -63,7 +63,7 @@ dmypy.json
 .DS_Store
 
 # Project data caches — large, regenerable, should never be committed
-data/
+/data/
 !data/.gitkeep
 output/
 logs/
