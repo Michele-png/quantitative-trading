@@ -218,7 +218,10 @@ class MarketContextBuilder:
     def _load_universe(self, symbols: list[str] | None) -> dict[str, str]:
         if symbols:
             return {symbol.upper(): symbol.upper() for symbol in symbols}
-        return self.universe_provider.fetch()
+        try:
+            return self.universe_provider.fetch()
+        except Exception:  # noqa: BLE001
+            return DEFAULT_LIQUID_SP500_SCREEN
 
     def _build_raw_candidates(
         self,
