@@ -15,6 +15,10 @@ on:
         description: "Allow submitting a paper order while the market is closed"
         default: "false"
         required: false
+      symbols:
+        description: "Optional comma-separated ticker subset for manual runs"
+        default: ""
+        required: false
   schedule:
     # Mondays at 14:45 UTC. The script still checks Alpaca market state before execution.
     - cron: "45 14 * * 1"
@@ -57,6 +61,9 @@ jobs:
           fi
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.allow_closed_market }}" = "true" ]; then
             EXTRA_ARGS="$EXTRA_ARGS --allow-closed-market"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.symbols }}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --symbols ${{ inputs.symbols }}"
           fi
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
