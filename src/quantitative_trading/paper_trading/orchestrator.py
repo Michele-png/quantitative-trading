@@ -74,6 +74,8 @@ class WeeklyPaperTrader:
         if not dry_run and require_market_open and not self.broker.is_market_open():
             raise RuntimeError("Market is not open according to Alpaca clock.")
 
+        if not dry_run:
+            self.broker.close_all_positions()
         account = self.broker.get_account()
         context = self.context_builder.build(
             trade_week=target_week,
@@ -108,7 +110,6 @@ class WeeklyPaperTrader:
         order_result = None
         event_type = "dry_run_week"
         if not dry_run:
-            self.broker.close_all_positions()
             order_result = self.broker.submit_notional_market_buy(
                 symbol=order_plan.symbol,
                 notional_usd=order_plan.notional_usd,
