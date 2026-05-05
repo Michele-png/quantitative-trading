@@ -157,5 +157,6 @@ def budget_capped_account(
         raise ValueError("eur_usd_rate must be positive.")
     budget_cap_usd = initial_budget_eur * eur_usd_rate
     cash_available = max(account.cash, 0.0)
-    cash_and_budget_cap = min(account.buying_power, cash_available, budget_cap_usd)
+    liquidation_value = max(cash_available, account.portfolio_value)
+    cash_and_budget_cap = min(account.buying_power, liquidation_value, budget_cap_usd)
     return replace(account, buying_power=cash_and_budget_cap)

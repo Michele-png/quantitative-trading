@@ -61,3 +61,20 @@ class TestBudgetCappedAccount:
         )
 
         assert capped.buying_power == pytest.approx(10_000)
+
+    def test_uses_liquidation_value_when_cash_is_tied_up_in_position(self) -> None:
+        account = AccountSnapshot(
+            currency="USD",
+            cash=-1_000,
+            buying_power=80_000,
+            portfolio_value=95_000,
+            trading_blocked=False,
+        )
+
+        capped = budget_capped_account(
+            account=account,
+            initial_budget_eur=100_000,
+            eur_usd_rate=1.2,
+        )
+
+        assert capped.buying_power == pytest.approx(80_000)
