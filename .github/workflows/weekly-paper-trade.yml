@@ -40,6 +40,7 @@ jobs:
       MAX_CANDIDATES_FOR_LLM: ${{ vars.MAX_CANDIDATES_FOR_LLM || '5' }}
       PRESELECT_COUNT: ${{ vars.PRESELECT_COUNT || '5' }}
       RESERVE_CASH_USD: ${{ vars.RESERVE_CASH_USD || '5.0' }}
+      SCHEDULE_SYMBOLS: ${{ vars.SCHEDULE_SYMBOLS || 'AAPL' }}
       DATA_DIR: data
     steps:
       - uses: actions/checkout@v4
@@ -64,6 +65,9 @@ jobs:
           fi
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.symbols }}" ]; then
             EXTRA_ARGS="$EXTRA_ARGS --symbols ${{ inputs.symbols }}"
+          fi
+          if [ "${{ github.event_name }}" = "schedule" ] && [ -n "$SCHEDULE_SYMBOLS" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --symbols $SCHEDULE_SYMBOLS"
           fi
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then

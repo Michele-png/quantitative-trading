@@ -44,3 +44,20 @@ class TestBudgetCappedAccount:
         )
 
         assert capped.buying_power == pytest.approx(5_000)
+
+    def test_caps_by_cash_to_avoid_margin(self) -> None:
+        account = AccountSnapshot(
+            currency="USD",
+            cash=10_000,
+            buying_power=20_000,
+            portfolio_value=10_000,
+            trading_blocked=False,
+        )
+
+        capped = budget_capped_account(
+            account=account,
+            initial_budget_eur=100_000,
+            eur_usd_rate=1.2,
+        )
+
+        assert capped.buying_power == pytest.approx(10_000)

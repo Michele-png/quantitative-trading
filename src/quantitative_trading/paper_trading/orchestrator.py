@@ -149,10 +149,12 @@ def budget_capped_account(
     initial_budget_eur: float,
     eur_usd_rate: float,
 ) -> AccountSnapshot:
-    """Cap available buying power to the experiment's EUR budget."""
+    """Cap available order size to cash and the experiment's EUR budget."""
     if initial_budget_eur <= 0:
         raise ValueError("initial_budget_eur must be positive.")
     if eur_usd_rate <= 0:
         raise ValueError("eur_usd_rate must be positive.")
     budget_cap_usd = initial_budget_eur * eur_usd_rate
-    return replace(account, buying_power=min(account.buying_power, budget_cap_usd))
+    cash_available = max(account.cash, 0.0)
+    cash_and_budget_cap = min(account.buying_power, cash_available, budget_cap_usd)
+    return replace(account, buying_power=cash_and_budget_cap)
