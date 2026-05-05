@@ -1,0 +1,73 @@
+name: Weekly Paper Trade
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run without placing paper orders"
+        default: "true"
+        required: true
+      trade_week:
+        description: "Optional Monday trade-week date, e.g. 2026-05-04"
+        default: ""
+        required: false
+      allow_closed_market:
+        description: "Allow submitting a paper order while the market is closed"
+        default: "false"
+        required: false
+      symbols:
+        description: "Optional comma-separated ticker subset for manual runs"
+        default: ""
+        required: false
+  schedule:
+    # Mondays at 14:45 UTC. The script still checks Alpaca market state before execution.
+    - cron: "45 14 * * 1"
+
+jobs:
+  weekly-paper-trade:
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-opus-4-7' }}
+      SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+      ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      APCA_API_BASE_URL: https://paper-api.alpaca.markets
+      POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+      INITIAL_BUDGET_EUR: ${{ vars.INITIAL_BUDGET_EUR }}
+      EUR_USD_RATE_SOURCE: polygon
+      ITALY_CAPITAL_GAINS_TAX_RATE: "0.26"
+      MAX_CANDIDATES_FOR_LLM: ${{ vars.MAX_CANDIDATES_FOR_LLM || '5' }}
+      PRESELECT_COUNT: ${{ vars.PRESELECT_COUNT || '5' }}
+      RESERVE_CASH_USD: ${{ vars.RESERVE_CASH_USD || '5.0' }}
+      DATA_DIR: data
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Run weekly paper trader
+        run: |
+          EXTRA_ARGS=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.trade_week }}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --trade-week ${{ inputs.trade_week }}"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.allow_closed_market }}" = "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --allow-closed-market"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.symbols }}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --symbols ${{ inputs.symbols }}"
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            python scripts/run_weekly_paper_trade.py --dry-run $EXTRA_ARGS
+          else
+            python scripts/run_weekly_paper_trade.py --execute $EXTRA_ARGS
+          fi
