@@ -10,6 +10,7 @@ authors = [{ name = "Michele Scalzotto" }]
 dependencies = [
     "anthropic>=0.40.0",
     "beautifulsoup4>=4.12.0",
+    "lifelines>=0.28.0",
     "lxml>=5.0.0",
     "numpy>=1.26.0",
     "pandas>=2.2.0",
@@ -17,6 +18,8 @@ dependencies = [
     "pydantic>=2.6.0",
     "python-dotenv>=1.0.0",
     "requests>=2.31.0",
+    "scipy>=1.13.0",
+    "statsmodels>=0.14.0",
     "tenacity>=8.2.0",
     "tqdm>=4.66.0",
     "yfinance>=0.2.40",
