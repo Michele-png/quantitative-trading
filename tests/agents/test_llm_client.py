@@ -143,13 +143,45 @@ def test_low_thinking_budget_maps_to_low_effort() -> None:
     assert kwargs["output_config"] == {"effort": "low"}
 
 
-def test_call_raises_when_no_tool_use_block() -> None:
+def test_call_raises_when_no_tool_use_or_parseable_text() -> None:
     block = MagicMock()
     block.type = "text"
+    block.text = "I am not JSON, just an apology."
     response = MagicMock()
     response.content = [block]
     anthropic = MagicMock()
     _wire_stream(anthropic, response)
     llm = LlmClient(anthropic_client=anthropic)
-    with pytest.raises(RuntimeError, match="no tool_use"):
+    with pytest.raises(RuntimeError, match="no parseable JSON"):
         llm.call(system_prompt="s", user_prompt="u", tool=_TOOL)
+
+
+def test_call_falls_back_to_json_in_text_block() -> None:
+    """When tool_choice=auto + thinking, the model sometimes writes prose
+    containing the JSON instead of calling the tool. The fallback should
+    extract it."""
+    thinking = MagicMock()
+    thinking.type = "thinking"
+    text = MagicMock()
+    text.type = "text"
+    text.text = 'Here is the result:\n```json\n{"x": 99}\n```'
+    response = MagicMock()
+    response.content = [thinking, text]
+    anthropic = MagicMock()
+    _wire_stream(anthropic, response)
+    llm = LlmClient(anthropic_client=anthropic)
+    result = llm.call(system_prompt="s", user_prompt="u", tool=_TOOL)
+    assert result.payload == {"x": 99}
+
+
+def test_call_falls_back_to_balanced_braces_when_no_fence() -> None:
+    text = MagicMock()
+    text.type = "text"
+    text.text = 'My answer: {"x": 7, "rationale": "ok"} — done.'
+    response = MagicMock()
+    response.content = [text]
+    anthropic = MagicMock()
+    _wire_stream(anthropic, response)
+    llm = LlmClient(anthropic_client=anthropic)
+    result = llm.call(system_prompt="s", user_prompt="u", tool=_TOOL)
+    assert result.payload == {"x": 7, "rationale": "ok"}

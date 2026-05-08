@@ -18,7 +18,9 @@ is conservative (no firm should pass purely on dry-run signals).
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,6 +36,38 @@ from quantitative_trading.config import get_config
 
 
 log = logging.getLogger(__name__)
+
+
+# Match either a fenced ```json ... ``` block or the first balanced { ... }
+# object in the text. Used as a fallback when the model writes prose instead
+# of calling the tool we offered.
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    """Best-effort extraction of a JSON object from free-form model text.
+
+    Returns the parsed dict, or None if no parseable JSON is found.
+    Tries fenced code blocks first, then falls back to the largest
+    well-balanced ``{ ... }`` substring.
+    """
+    if not text:
+        return None
+    fenced = _JSON_FENCE_RE.search(text)
+    candidates = [fenced.group(1)] if fenced else []
+    # Largest balanced { ... } substring as a fallback.
+    start = text.find("{")
+    end = text.rfind("}")
+    if 0 <= start < end:
+        candidates.append(text[start : end + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
 # Anthropic Opus 4.7 list pricing as of release (USD per million tokens). Used
@@ -202,10 +236,20 @@ class LlmClient:
         # See https://github.com/anthropics/anthropic-sdk-python#long-requests.
         with self._client.messages.stream(**kwargs) as stream:
             response = stream.get_final_message()
+        # Preferred path: model called the tool we offered.
         for block in response.content:
             if getattr(block, "type", None) == "tool_use":
                 return dict(block.input)
+        # Fallback path: with tool_choice=auto + extended thinking the model
+        # occasionally writes prose instead of calling the tool. Try to
+        # recover by extracting a JSON object from the first text block —
+        # the prose usually IS the JSON the tool would have received.
+        for block in response.content:
+            if getattr(block, "type", None) == "text":
+                payload = _extract_json_object(getattr(block, "text", "") or "")
+                if payload is not None:
+                    return payload
         raise RuntimeError(
-            "Anthropic returned no tool_use block; got blocks: "
-            f"{[getattr(b, 'type', None) for b in response.content]}"
+            "Anthropic returned no tool_use block and no parseable JSON in "
+            f"text; got blocks: {[getattr(b, 'type', None) for b in response.content]}"
         )
