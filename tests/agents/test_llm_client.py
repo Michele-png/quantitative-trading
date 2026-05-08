@@ -65,7 +65,10 @@ def test_call_invokes_anthropic_with_thinking_enabled() -> None:
     assert not result.dry_run
     kwargs = anthropic.messages.stream.call_args.kwargs
     assert kwargs["model"] == "claude-opus-4-7"
-    assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 10000}
+    # Opus 4.7 uses the adaptive thinking shape; budget_tokens is mapped to
+    # output_config.effort. 10k tokens -> "medium".
+    assert kwargs["thinking"] == {"type": "adaptive"}
+    assert kwargs["output_config"] == {"effort": "medium"}
     # When thinking is enabled, Anthropic disallows forced specific-tool
     # selection, so we fall back to ``auto`` (the model picks the only tool
     # we provide).
@@ -115,8 +118,29 @@ def test_zero_thinking_budget_omits_thinking_param() -> None:
     llm.call(system_prompt="s", user_prompt="u", tool=_TOOL)
     kwargs = anthropic.messages.stream.call_args.kwargs
     assert "thinking" not in kwargs
+    assert "output_config" not in kwargs
     # With thinking disabled, the deterministic forced-specific-tool path is safe.
     assert kwargs["tool_choice"] == {"type": "tool", "name": "submit_test"}
+
+
+def test_high_thinking_budget_maps_to_high_effort() -> None:
+    anthropic = MagicMock()
+    _wire_stream(anthropic, _make_response({"x": 1}))
+    llm = LlmClient(anthropic_client=anthropic, thinking_budget_tokens=64_000)
+    llm.call(system_prompt="s", user_prompt="u", tool=_TOOL)
+    kwargs = anthropic.messages.stream.call_args.kwargs
+    assert kwargs["thinking"] == {"type": "adaptive"}
+    assert kwargs["output_config"] == {"effort": "high"}
+
+
+def test_low_thinking_budget_maps_to_low_effort() -> None:
+    anthropic = MagicMock()
+    _wire_stream(anthropic, _make_response({"x": 1}))
+    llm = LlmClient(anthropic_client=anthropic, thinking_budget_tokens=2_000)
+    llm.call(system_prompt="s", user_prompt="u", tool=_TOOL)
+    kwargs = anthropic.messages.stream.call_args.kwargs
+    assert kwargs["thinking"] == {"type": "adaptive"}
+    assert kwargs["output_config"] == {"effort": "low"}
 
 
 def test_call_raises_when_no_tool_use_block() -> None:

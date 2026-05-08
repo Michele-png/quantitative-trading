@@ -179,10 +179,21 @@ class LlmClient:
             "messages": [{"role": "user", "content": user_prompt}],
         }
         if self._thinking_budget_tokens > 0:
-            kwargs["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": self._thinking_budget_tokens,
-            }
+            # Opus 4.7 dropped the legacy ``thinking: {type: enabled,
+            # budget_tokens: N}`` shape and requires the new adaptive form
+            # plus ``output_config.effort``. We map the legacy budget knob to
+            # an effort level so existing env vars keep working:
+            #   budget >= 32k tokens -> "high"   (deep, expensive)
+            #   budget >=  8k tokens -> "medium"
+            #   budget  >  0  tokens -> "low"
+            if self._thinking_budget_tokens >= 32_000:
+                effort = "high"
+            elif self._thinking_budget_tokens >= 8_000:
+                effort = "medium"
+            else:
+                effort = "low"
+            kwargs["thinking"] = {"type": "adaptive"}
+            kwargs["output_config"] = {"effort": effort}
         # Use streaming because Opus 4.7 with extended thinking and a 1M-token
         # context can exceed Anthropic's 10-minute non-streaming SLA. The
         # streaming path is functionally equivalent — `.get_final_message()`
