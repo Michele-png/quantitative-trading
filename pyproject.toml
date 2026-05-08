@@ -56,4 +56,5 @@ ignore = ["PLR0913", "PLR2004"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 addopts = "-p no:zarr -v --tb=short"

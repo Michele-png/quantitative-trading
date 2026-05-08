@@ -73,7 +73,11 @@ creation through prudent capital allocation.</p>
 
 @pytest.fixture
 def mock_anthropic_response_pass_all() -> MagicMock:
-    """Mock Anthropic Messages.create response for a 'pass all 3 Ms' result."""
+    """Mock Anthropic Messages.create response for a 'pass Meaning + Moat' result.
+
+    Management was removed from FourMsAnalyzer in the v2 refactor; it now lives
+    in ``management_llm.py`` and is scored by a multi-document pipeline.
+    """
     block = MagicMock()
     block.type = "tool_use"
     block.input = {
@@ -85,11 +89,6 @@ def mock_anthropic_response_pass_all() -> MagicMock:
             "passes": True,
             "moat_type": "brand",
             "rationale": "Worldwide brand recognition + patents indicate durable competitive advantage.",
-        },
-        "management": {
-            "passes": True,
-            "rationale": "MD&A indicates focus on long-term value and prudent capital allocation.",
-            "red_flags": [],
         },
     }
     response = MagicMock()
@@ -221,8 +220,10 @@ def test_evaluate_makes_one_llm_call_and_caches(
     result1 = analyzer.evaluate("FAKE", as_of=date(2024, 1, 1))
     result2 = analyzer.evaluate("FAKE", as_of=date(2024, 1, 1))
 
-    assert result1.all_pass
-    assert result1.meaning.passes and result1.moat.passes and result1.management.passes
+    assert result1.meaning.passes and result1.moat.passes
+    # Management is no longer scored here — agent fills it from ManagementResult.
+    assert not result1.management.passes
+    assert "Not scored" in result1.management.rationale
     assert result1.moat.details["moat_type"] == "brand"
     assert not result1.cached
     assert result2.cached
@@ -330,14 +331,14 @@ def test_evaluate_handles_string_field_in_response(
     fake_10k_html: str,
     tmp_path: Path,
 ) -> None:
-    """If the LLM returns 'management' as a JSON string (Claude misbehavior),
+    """If the LLM returns 'moat' as a JSON string (Claude misbehavior),
     the analyzer should still produce a valid result rather than crash."""
     block = MagicMock()
     block.type = "tool_use"
     block.input = {
         "meaning": {"passes": True, "rationale": "ok"},
-        "moat": {"passes": True, "moat_type": "brand", "rationale": "ok"},
-        "management": '{"passes": false, "rationale": "red flags exist"}',  # STRING
+        # STRING-encoded moat — exercises the _coerce_to_dict tolerance path.
+        "moat": '{"passes": true, "moat_type": "brand", "rationale": "ok"}',
     }
     response = MagicMock()
     response.content = [block]
@@ -363,10 +364,9 @@ def test_evaluate_handles_string_field_in_response(
     result = analyzer.evaluate("FAKE", as_of=date(2024, 1, 1))
 
     assert result.meaning.passes is True
+    # The string-encoded moat was correctly decoded.
     assert result.moat.passes is True
-    # The string-encoded management was correctly decoded.
-    assert result.management.passes is False
-    assert "red flags" in result.management.rationale
+    assert result.moat.details["moat_type"] == "brand"
 
 
 def test_cache_payload_is_valid_json(
@@ -399,4 +399,5 @@ def test_cache_payload_is_valid_json(
     payload = json.loads(cached_files[0].read_text())
     assert "meaning" in payload
     assert "moat" in payload
-    assert "management" in payload
+    # Management is no longer scored by FourMsAnalyzer post-v2 refactor.
+    assert "management" not in payload

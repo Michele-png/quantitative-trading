@@ -1,29 +1,27 @@
-"""LLM-driven analysis of Phil Town's 4 Ms (Meaning, Moat, Management).
+"""LLM-driven analysis of Phil Town's first two qualitative Ms (Meaning, Moat).
 
-The 4th M (Margin of Safety) is computed deterministically in
-`sticker_price.py`; this module handles the qualitative three.
+Management was extracted into a dedicated multi-document, multi-prompt pipeline
+in ``management_llm.py``. The 4th M (Margin of Safety) is computed
+deterministically in ``sticker_price.py``. This module is now responsible for
+just two checks:
 
-For a (ticker, fiscal_year), we:
-    1. Locate the most recent 10-K filed before `as_of` (PIT-correct).
+    * MEANING — clear, durable business in your circle of competence.
+    * MOAT    — at least one of Phil Town's 5 moat types is durable for 10+ yr.
+
+For a (ticker, as_of), we:
+    1. Locate the most recent 10-K filed before ``as_of`` (PIT-correct).
     2. Fetch and clean the filing's primary document text.
     3. Extract Item 1 (Business), Item 1A (Risk Factors), Item 7 (MD&A) when
        parseable; fall back to a truncated full document otherwise.
-    4. Send to Claude with a structured tool schema asking for pass/fail +
-       rationale on each M.
+    4. Send to Anthropic via the shared ``LlmClient`` (Opus 4.7 + extended
+       thinking by default) with a structured tool schema asking for pass/fail
+       + rationale on each M.
     5. Cache the structured response on disk keyed by
-       (ticker, fiscal_year, prompt_version, model). Re-running with the same
-       inputs costs zero additional API calls.
-
-Cost considerations:
-    * Default model: claude-sonnet-4-5 (~$3 in / $15 out per MTok).
-    * 10-K text is truncated to `MAX_INPUT_CHARS` chars (default 80k ≈ 20k
-      tokens). Typical cost per call: ~$0.06–0.12.
-    * Caching makes the *full backtest* cheap — only fresh (ticker, FY) pairs
-      hit the API.
+       ``(ticker, fiscal_year, prompt_version, model, thinking_budget)``.
 
 Contamination caveat:
     The LLM has seen the future. We can't completely solve this, but we can
-    estimate the contamination effect by re-running with `ticker_masked=True`,
+    estimate the contamination effect by re-running with ``ticker_masked=True``,
     which scrubs the ticker symbol and company name from the prompt. This
     forces the model to reason from the filing text alone.
 """
@@ -43,17 +41,12 @@ import warnings
 
 from anthropic import Anthropic
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
 # SEC filings are sometimes XBRL/XML. We deliberately use the HTML parser to
 # get plain text out — the XML warning is noise in this context.
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
+from quantitative_trading.agents.rule_one.llm_client import LlmClient
 from quantitative_trading.config import get_config
 from quantitative_trading.data.edgar import EdgarClient
 from quantitative_trading.data.pit_facts import PointInTimeFacts
@@ -62,9 +55,8 @@ from quantitative_trading.data.pit_facts import PointInTimeFacts
 log = logging.getLogger(__name__)
 
 
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = "v2"  # v1 → v2: dropped Management; cache invalidated.
 MAX_INPUT_CHARS = 80_000  # ~20k tokens for the 10-K excerpt
-MAX_OUTPUT_TOKENS = 1_500
 
 
 # ---------------------------------------------------------------- Data types
@@ -82,7 +74,17 @@ class MCheck:
 
 @dataclass(frozen=True)
 class FourMsResult:
-    """Aggregate result of the 3 LLM-driven Ms (4th = Margin of Safety, separate)."""
+    """Aggregate result of the LLM-driven qualitative Ms.
+
+    Holds the 2 Ms scored in this module (Meaning, Moat) and the optional
+    Management result attached by the agent after the dedicated multi-document
+    pipeline runs. The 4th M (Margin of Safety) is deterministic and lives in
+    ``sticker_price.py``.
+
+    The ``management`` field is included for back-compat with the existing
+    backtest schema and downstream consumers (dataset builder, agent
+    decisions). Its ``MCheck`` is built from the new ``ManagementResult``.
+    """
 
     ticker: str
     as_of: date
@@ -221,7 +223,9 @@ def find_pit_10k(
 
 _SYSTEM_PROMPT = """You are a senior equity analyst applying Phil Town's Rule One value-investing framework.
 
-You evaluate a company on three qualitative pillars (the "first three Ms"):
+You evaluate a company on TWO qualitative pillars in this analysis. The Management
+pillar is scored separately by a dedicated multi-document pipeline (transcripts,
+DEF 14A, Form 4) and is NOT part of your task here.
 
 1. MEANING
    - The company's business is understandable to a competent investor.
@@ -238,14 +242,7 @@ You evaluate a company on three qualitative pillars (the "first three Ms"):
      * PRICE moat — durable cost advantage (Walmart, Costco).
    - Pass criteria: at least one identifiable moat type that is durable for 10+ years.
 
-3. MANAGEMENT
-   - CEO and leadership are trustworthy, candid, and focused on long-term shareholder value.
-   - Capital allocation is rational (reinvestment, buybacks, dividends in sensible mix).
-   - No major red flags: ongoing litigation, fraud allegations, executive churn,
-     overcompensation relative to performance, related-party transactions, accounting concerns.
-   - Pass criteria: visible signs of competent, owner-aligned management; no red flags.
-
-You MUST be conservative. When in doubt, FAIL the check. Most companies do NOT pass all three.
+You MUST be conservative. When in doubt, FAIL the check. Most companies do NOT pass both.
 Use ONLY information from the supplied 10-K text. Do not use information you have about the
 company's later performance, news, or events that occurred after the filing date.
 
@@ -291,7 +288,7 @@ def _build_user_prompt(
         full = full[:truncate_to] + "\n\n[... truncated for length ...]"
 
     return (
-        f"Apply the Rule One Meaning / Moat / Management checks to the following 10-K filing.\n\n"
+        f"Apply the Rule One Meaning and Moat checks to the following 10-K filing.\n\n"
         f"{identifier_block}\n"
         f"--- 10-K excerpt begins ---{full}\n--- 10-K excerpt ends ---"
     )
@@ -299,9 +296,9 @@ def _build_user_prompt(
 
 # Tool schema for structured output (Anthropic's tool calling for guaranteed JSON).
 _TOOL_DEF: dict[str, Any] = {
-    "name": "submit_four_ms_assessment",
+    "name": "submit_meaning_moat_assessment",
     "description": (
-        "Submit your Rule One Meaning / Moat / Management assessment for the company "
+        "Submit your Rule One Meaning and Moat assessment for the company "
         "based ONLY on the supplied 10-K text."
     ),
     "input_schema": {
@@ -329,22 +326,8 @@ _TOOL_DEF: dict[str, Any] = {
                 "required": ["passes", "moat_type", "rationale"],
                 "additionalProperties": False,
             },
-            "management": {
-                "type": "object",
-                "properties": {
-                    "passes": {"type": "boolean"},
-                    "rationale": {"type": "string", "maxLength": 600},
-                    "red_flags": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Specific red flags identified, if any",
-                    },
-                },
-                "required": ["passes", "rationale"],
-                "additionalProperties": False,
-            },
         },
-        "required": ["meaning", "moat", "management"],
+        "required": ["meaning", "moat"],
         "additionalProperties": False,
     },
 }
@@ -361,10 +344,12 @@ def _cache_key(
     model: str,
     ticker_masked: bool,
     prompt_version: str,
+    thinking_budget: int = 0,
 ) -> str:
     raw = (
         f"{ticker.upper()}|FY={fiscal_year}|accn={accession}|"
-        f"model={model}|masked={int(ticker_masked)}|prompt={prompt_version}"
+        f"model={model}|masked={int(ticker_masked)}|prompt={prompt_version}|"
+        f"think={thinking_budget}"
     )
     return hashlib.sha256(raw.encode()).hexdigest()[:24] + ".json"
 
@@ -417,18 +402,29 @@ def _coerce_to_dict(value: Any) -> dict[str, Any]:
 
 
 class FourMsAnalyzer:
-    """LLM-driven Meaning / Moat / Management analyzer with disk caching."""
+    """LLM-driven Meaning + Moat analyzer with disk caching.
+
+    Management is intentionally NOT scored here; the agent's
+    ``ManagementAnalyzer`` runs the multi-document pipeline and the agent
+    composes its result into the ``FourMsResult.management`` field.
+    """
 
     def __init__(
         self,
         edgar_client: EdgarClient,
         anthropic_client: Anthropic | None = None,
         cache_dir: Path | None = None,
+        llm_client: LlmClient | None = None,
     ) -> None:
         cfg = get_config()
         self._edgar = edgar_client
-        self._client = anthropic_client or Anthropic(api_key=cfg.anthropic_api_key)
-        self._model = cfg.anthropic_model
+        # Prefer the shared LlmClient (Opus 4.7 + extended thinking) but fall
+        # back to a raw client for tests that mock ``Anthropic.messages.create``.
+        if llm_client is not None:
+            self._llm = llm_client
+        else:
+            self._llm = LlmClient(anthropic_client=anthropic_client)
+        self._model = self._llm.model
         self._cache_dir = cache_dir or cfg.llm_cache_dir
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -458,6 +454,7 @@ class FourMsAnalyzer:
             ticker=ticker, fiscal_year=fy, accession=accession,
             model=self._model, ticker_masked=ticker_masked,
             prompt_version=PROMPT_VERSION,
+            thinking_budget=self._llm.thinking_budget_tokens,
         )
         if cache_path.exists():
             cached = json.loads(cache_path.read_text())
@@ -490,34 +487,21 @@ class FourMsAnalyzer:
             truncate_to=max_input_chars,
         )
 
-        payload = self._call_llm(prompt)
-        cache_path.write_text(json.dumps(payload, indent=2))
+        result = self._llm.call(
+            system_prompt=_SYSTEM_PROMPT,
+            user_prompt=prompt,
+            tool=_TOOL_DEF,
+            dry_run_payload={
+                "meaning": {"passes": False, "rationale": "[dry-run]"},
+                "moat": {"passes": False, "moat_type": "none",
+                         "rationale": "[dry-run]"},
+            },
+        )
+        payload = result.payload
+        if not result.dry_run:
+            cache_path.write_text(json.dumps(payload, indent=2))
         return self._result_from_payload(
             ticker, as_of, fy, accession, payload, cached_flag=False,
-        )
-
-    @retry(
-        retry=retry_if_exception_type(Exception),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=2, min=2, max=30),
-        reraise=True,
-    )
-    def _call_llm(self, user_prompt: str) -> dict[str, Any]:
-        log.info("Calling Anthropic %s for 4Ms analysis", self._model)
-        response = self._client.messages.create(
-            model=self._model,
-            max_tokens=MAX_OUTPUT_TOKENS,
-            system=_SYSTEM_PROMPT,
-            tools=[_TOOL_DEF],
-            tool_choice={"type": "tool", "name": _TOOL_DEF["name"]},
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-        for block in response.content:
-            if getattr(block, "type", None) == "tool_use":
-                return dict(block.input)
-        raise RuntimeError(
-            "Anthropic returned no tool_use block; response was: "
-            f"{[b.type for b in response.content]}"
         )
 
     # ------------------------------------------------------------- Helpers
@@ -534,7 +518,9 @@ class FourMsAnalyzer:
     ) -> FourMsResult:
         meaning = _coerce_to_dict(payload.get("meaning"))
         moat = _coerce_to_dict(payload.get("moat"))
-        mgmt = _coerce_to_dict(payload.get("management"))
+        # Management is no longer scored by this analyzer. We materialize an
+        # explicit "not evaluated" MCheck — the agent overrides it with the
+        # real ManagementResult before exposing the FourMsResult to callers.
         return FourMsResult(
             ticker=ticker.upper(),
             as_of=as_of,
@@ -554,9 +540,8 @@ class FourMsAnalyzer:
             ),
             management=MCheck(
                 name="Management",
-                passes=bool(mgmt.get("passes", False)),
-                rationale=str(mgmt.get("rationale", "")),
-                details={"red_flags": mgmt.get("red_flags", [])},
+                passes=False,
+                rationale="Not scored by FourMsAnalyzer; see ManagementResult.",
             ),
             cached=cached_flag,
             raw_response=payload,
@@ -571,7 +556,6 @@ class FourMsAnalyzer:
         accession: str | None,
         reason: str,
     ) -> FourMsResult:
-        empty = MCheck(name="", passes=False, rationale=reason)
         return FourMsResult(
             ticker=ticker.upper(), as_of=as_of, fiscal_year=fiscal_year,
             accession=accession, model=self._model,

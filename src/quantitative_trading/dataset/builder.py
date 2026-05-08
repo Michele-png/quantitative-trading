@@ -73,6 +73,8 @@ def _row_from_result(
     sp = result.sticker
     pb = result.payback
     fm = result.four_ms
+    qx = result.quant_extras
+    mg = result.management
 
     row: dict[str, Any] = {
         "ticker": result.ticker,
@@ -104,6 +106,28 @@ def _row_from_result(
         "value_payback_years": pb.payback_years,
         "value_current_ratio": b5.current_ratio.value,
 
+        # Phil Town extras (soft flags)
+        "check_debt_payoff": qx.debt_payoff.passes if qx is not None else None,
+        "check_dilution": qx.dilution.passes if qx is not None else None,
+        "check_dividend_quality": qx.dividend_quality.passes if qx is not None else None,
+        "value_debt_payoff_years": qx.debt_payoff.value if qx is not None else None,
+        "value_dilution_cagr": qx.dilution.value if qx is not None else None,
+        "value_dividend_payout_ratio": (
+            qx.dividend_details.payout_ratio if qx is not None else None
+        ),
+        "value_dividend_yield": (
+            qx.dividend_details.dividend_yield if qx is not None else None
+        ),
+        "dividend_payout_band": (
+            qx.dividend_details.payout_band if qx is not None else None
+        ),
+        "dividend_debt_funded": (
+            qx.dividend_details.debt_funded_dividend if qx is not None else None
+        ),
+        "dividend_yield_trap": (
+            qx.dividend_details.yield_trap if qx is not None else None
+        ),
+
         # LLM checks
         "check_meaning": fm.meaning.passes if fm is not None else None,
         "check_moat": fm.moat.passes if fm is not None else None,
@@ -118,6 +142,23 @@ def _row_from_result(
         "llm_meaning_rationale": fm.meaning.rationale if fm is not None else None,
         "llm_moat_rationale": fm.moat.rationale if fm is not None else None,
         "llm_management_rationale": fm.management.rationale if fm is not None else None,
+
+        # Management sub-checks (multi-document pipeline)
+        "check_mgmt_blame": mg.blame.passes if mg is not None else None,
+        "check_mgmt_long_short": mg.long_short.passes if mg is not None else None,
+        "check_mgmt_clarity": mg.clarity.passes if mg is not None else None,
+        "check_mgmt_compensation": mg.compensation.passes if mg is not None else None,
+        "check_mgmt_insider": mg.insider.passes if mg is not None else None,
+        "value_mgmt_clarity_score": mg.clarity.score if mg is not None else None,
+        "value_mgmt_long_short_ratio": (
+            mg.long_short.details.get("ratio") if mg is not None else None
+        ),
+        "value_mgmt_insider_net_usd": (
+            mg.insider.details.get("net_open_market_value_usd")
+            if mg is not None else None
+        ),
+        "mgmt_bundle_hash": mg.bundle_hash if mg is not None else None,
+        "mgmt_cached": mg.cached if mg is not None else None,
 
         # Decision derivations
         "decision_quant_pass": result.quant_pass,

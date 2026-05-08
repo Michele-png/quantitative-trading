@@ -1,0 +1,110 @@
+"""Tests for the shared LlmClient wrapper."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+from quantitative_trading.agents.rule_one.llm_client import LlmClient
+from quantitative_trading.config import get_config
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cfg(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("SEC_USER_AGENT", "Test User test@example.com")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    get_config.cache_clear()
+
+
+def _make_response(payload: dict) -> MagicMock:
+    block = MagicMock()
+    block.type = "tool_use"
+    block.input = payload
+    response = MagicMock()
+    response.content = [block]
+    return response
+
+
+_TOOL = {
+    "name": "submit_test",
+    "description": "test",
+    "input_schema": {
+        "type": "object",
+        "properties": {"x": {"type": "integer"}},
+        "required": ["x"],
+        "additionalProperties": False,
+    },
+}
+
+
+def test_call_invokes_anthropic_with_thinking_enabled() -> None:
+    anthropic = MagicMock()
+    anthropic.messages.create.return_value = _make_response({"x": 42})
+    llm = LlmClient(anthropic_client=anthropic, thinking_budget_tokens=10000)
+    result = llm.call(
+        system_prompt="sys", user_prompt="user", tool=_TOOL,
+    )
+    assert result.payload == {"x": 42}
+    assert not result.dry_run
+    kwargs = anthropic.messages.create.call_args.kwargs
+    assert kwargs["model"] == "claude-opus-4-7"
+    assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 10000}
+    assert kwargs["tool_choice"] == {"type": "tool", "name": "submit_test"}
+
+
+def test_dry_run_skips_anthropic_and_returns_payload() -> None:
+    anthropic = MagicMock()
+    llm = LlmClient(anthropic_client=anthropic, dry_run=True)
+    result = llm.call(
+        system_prompt="sys", user_prompt="user", tool=_TOOL,
+        dry_run_payload={"x": 0},
+    )
+    assert result.dry_run
+    assert result.payload == {"x": 0}
+    anthropic.messages.create.assert_not_called()
+
+
+def test_max_tokens_at_least_thinking_budget_plus_buffer() -> None:
+    anthropic = MagicMock()
+    anthropic.messages.create.return_value = _make_response({"x": 1})
+    llm = LlmClient(
+        anthropic_client=anthropic, thinking_budget_tokens=20000,
+        max_output_tokens=4096,
+    )
+    llm.call(system_prompt="s", user_prompt="u", tool=_TOOL)
+    kwargs = anthropic.messages.create.call_args.kwargs
+    # Anthropic requires max_tokens > thinking budget; we keep a 2k buffer.
+    assert kwargs["max_tokens"] >= 20000 + 2000
+
+
+def test_truncate_trims_long_text() -> None:
+    llm = LlmClient(
+        anthropic_client=MagicMock(), max_input_chars=100,
+    )
+    out = llm.truncate("a" * 200)
+    assert len(out) < 200
+    assert "truncated" in out
+
+
+def test_zero_thinking_budget_omits_thinking_param() -> None:
+    anthropic = MagicMock()
+    anthropic.messages.create.return_value = _make_response({"x": 1})
+    llm = LlmClient(anthropic_client=anthropic, thinking_budget_tokens=0)
+    llm.call(system_prompt="s", user_prompt="u", tool=_TOOL)
+    kwargs = anthropic.messages.create.call_args.kwargs
+    assert "thinking" not in kwargs
+
+
+def test_call_raises_when_no_tool_use_block() -> None:
+    block = MagicMock()
+    block.type = "text"
+    response = MagicMock()
+    response.content = [block]
+    anthropic = MagicMock()
+    anthropic.messages.create.return_value = response
+    llm = LlmClient(anthropic_client=anthropic)
+    with pytest.raises(RuntimeError, match="no tool_use"):
+        llm.call(system_prompt="s", user_prompt="u", tool=_TOOL)

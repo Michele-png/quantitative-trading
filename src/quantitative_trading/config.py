@@ -38,6 +38,9 @@ class Config:
     sec_user_agent: str
     data_dir: Path
     project_root: Path
+    fmp_api_key: str | None
+    anthropic_thinking_budget_tokens: int
+    anthropic_max_input_chars: int
 
     @property
     def edgar_cache_dir(self) -> Path:
@@ -59,6 +62,10 @@ class Config:
     def dataset_dir(self) -> Path:
         return self.data_dir / "dataset"
 
+    @property
+    def transcripts_cache_dir(self) -> Path:
+        return self.data_dir / "transcripts"
+
     def ensure_dirs(self) -> None:
         for d in (
             self.data_dir,
@@ -67,6 +74,7 @@ class Config:
             self.llm_cache_dir,
             self.universe_dir,
             self.dataset_dir,
+            self.transcripts_cache_dir,
         ):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -98,6 +106,16 @@ def _validate_sec_user_agent(value: str) -> str:
     return value
 
 
+def _parse_int(var: str, default: int) -> int:
+    raw = os.environ.get(var, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{var} must be an integer (got {raw!r}).") from exc
+
+
 @lru_cache(maxsize=1)
 def get_config() -> Config:
     root = _project_root()
@@ -106,12 +124,26 @@ def get_config() -> Config:
     if not data_dir.is_absolute():
         data_dir = root / data_dir
 
+    fmp_api_key_raw = os.environ.get("FMP_API_KEY", "").strip()
+
     cfg = Config(
         anthropic_api_key=_require("ANTHROPIC_API_KEY"),
-        anthropic_model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929").strip(),
+        anthropic_model=os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-7").strip(),
         sec_user_agent=_validate_sec_user_agent(_require("SEC_USER_AGENT")),
         data_dir=data_dir,
         project_root=root,
+        fmp_api_key=fmp_api_key_raw or None,
+        # Extended-thinking budget for Opus 4.7. 32k is conservative; the model
+        # supports more, but each thinking token is billed as output ($25/MTok).
+        anthropic_thinking_budget_tokens=_parse_int(
+            "ANTHROPIC_THINKING_BUDGET_TOKENS", 32_000
+        ),
+        # ~1M-token context for Opus 4.7. We translate input-token budget into
+        # an approximate character cap (4 chars/token average) used by the
+        # management pipeline when packing many documents.
+        anthropic_max_input_chars=_parse_int(
+            "ANTHROPIC_MAX_INPUT_CHARS", 3_500_000
+        ),
     )
     cfg.ensure_dirs()
     return cfg

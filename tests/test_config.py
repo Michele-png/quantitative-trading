@@ -17,7 +17,15 @@ from quantitative_trading.config import ConfigError, get_config
 def _isolate_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """Clear config cache and any inherited Anthropic/SEC env vars before each test."""
     get_config.cache_clear()
-    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "SEC_USER_AGENT", "DATA_DIR"):
+    for var in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_THINKING_BUDGET_TOKENS",
+        "ANTHROPIC_MAX_INPUT_CHARS",
+        "FMP_API_KEY",
+        "SEC_USER_AGENT",
+        "DATA_DIR",
+    ):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -76,3 +84,54 @@ def test_default_data_dir_is_relative_to_project(
 
     assert cfg.data_dir.is_absolute()
     assert cfg.data_dir == cfg.project_root / "data"
+
+
+def test_fmp_key_optional_and_blank_becomes_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("SEC_USER_AGENT", "Test User test@example.com")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+
+    cfg = get_config()
+    assert cfg.fmp_api_key is None
+    assert cfg.transcripts_cache_dir.exists()
+
+
+def test_thinking_budget_and_max_input_chars_have_defaults(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("SEC_USER_AGENT", "Test User test@example.com")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+
+    cfg = get_config()
+    assert cfg.anthropic_thinking_budget_tokens == 32_000
+    assert cfg.anthropic_max_input_chars == 3_500_000
+    assert cfg.anthropic_model == "claude-opus-4-7"
+
+
+def test_thinking_budget_overridden_by_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("SEC_USER_AGENT", "Test User test@example.com")
+    monkeypatch.setenv("ANTHROPIC_THINKING_BUDGET_TOKENS", "12345")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+
+    cfg = get_config()
+    assert cfg.anthropic_thinking_budget_tokens == 12345
+
+
+def test_invalid_thinking_budget_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from quantitative_trading.config import ConfigError
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("SEC_USER_AGENT", "Test User test@example.com")
+    monkeypatch.setenv("ANTHROPIC_THINKING_BUDGET_TOKENS", "not_a_number")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+
+    with pytest.raises(ConfigError, match="ANTHROPIC_THINKING_BUDGET_TOKENS"):
+        get_config()

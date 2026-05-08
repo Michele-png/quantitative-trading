@@ -62,6 +62,9 @@ dmypy.json
 *.swo
 .DS_Store
 
+# Local AI chat transcript dumps — never commit
+chats/
+
 # Project data caches — large, regenerable, should never be committed
 # (anchored to top-level /data/ only; src/quantitative_trading/data/ and
 #  tests/data/ are source code and MUST be tracked)

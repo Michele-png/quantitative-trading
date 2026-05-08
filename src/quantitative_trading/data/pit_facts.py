@@ -104,6 +104,26 @@ CONCEPTS: dict[str, list[str]] = {
     "weighted_avg_shares_diluted": [
         "WeightedAverageNumberOfDilutedSharesOutstanding",
     ],
+    # Diluted weighted-average is preferred over the raw period-end share count
+    # because (a) it captures dilution from options and convertibles, and (b)
+    # SEC reports it consistently across 10-K filings.
+    "shares_outstanding": [
+        "WeightedAverageNumberOfDilutedSharesOutstanding",
+        "WeightedAverageNumberOfSharesOutstandingBasic",
+        "CommonStockSharesOutstanding",
+    ],
+    "dividends_paid_cash": [
+        "PaymentsOfDividends",
+        "PaymentsOfDividendsCommonStock",
+    ],
+    "dividends_per_share": [
+        "CommonStockDividendsPerShareDeclared",
+        "CommonStockDividendsPerShareCashPaid",
+    ],
+    "cash_and_equivalents": [
+        "CashAndCashEquivalentsAtCarryingValue",
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+    ],
 }
 
 
@@ -116,6 +136,9 @@ _FLOW_GROUPS: set[str] = {
     "operating_cash_flow",
     "capex",
     "weighted_avg_shares_diluted",
+    "shares_outstanding",
+    "dividends_paid_cash",
+    "dividends_per_share",
 }
 
 
@@ -134,6 +157,10 @@ _UNIT_FOR: dict[str, str] = {
     "total_assets": "USD",
     "shares_outstanding_dei": "shares",
     "weighted_avg_shares_diluted": "shares",
+    "shares_outstanding": "shares",
+    "dividends_paid_cash": "USD",
+    "dividends_per_share": "USD/shares",
+    "cash_and_equivalents": "USD",
 }
 
 

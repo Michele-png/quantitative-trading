@@ -279,3 +279,21 @@ class EdgarClient:
         text = resp.text
         cache_file.write_text(text, errors="replace")
         return text
+
+    def fetch_form4_xml(
+        self,
+        cik: int,
+        accession: str,
+        primary_document: str | None = None,
+    ) -> str:
+        """Fetch the structured Form 4 XML document for an insider-trading filing.
+
+        Form 4 filings always include a machine-readable XML primary document.
+        When ``primary_document`` is omitted (or doesn't end in ``.xml``), we
+        fall back to the canonical filename ``<accession>.xml`` that EDGAR uses
+        for the structured XML alongside the human-readable HTML wrapper.
+        """
+        candidate = primary_document or ""
+        if not candidate.lower().endswith(".xml"):
+            candidate = f"{accession}.xml"
+        return self.fetch_filing_document(cik, accession, candidate)
