@@ -172,7 +172,14 @@ class LlmClient:
                 "type": "enabled",
                 "budget_tokens": self._thinking_budget_tokens,
             }
-        response = self._client.messages.create(**kwargs)
+        # Use streaming because Opus 4.7 with extended thinking and a 1M-token
+        # context can exceed Anthropic's 10-minute non-streaming SLA. The
+        # streaming path is functionally equivalent — `.get_final_message()`
+        # returns the same Message structure as `.messages.create()` once the
+        # stream completes — but is the only supported way to make long calls.
+        # See https://github.com/anthropics/anthropic-sdk-python#long-requests.
+        with self._client.messages.stream(**kwargs) as stream:
+            response = stream.get_final_message()
         for block in response.content:
             if getattr(block, "type", None) == "tool_use":
                 return dict(block.input)

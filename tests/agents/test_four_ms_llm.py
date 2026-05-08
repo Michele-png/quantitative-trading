@@ -24,6 +24,21 @@ from quantitative_trading.agents.rule_one.four_ms_llm import (
 from quantitative_trading.config import get_config
 
 
+def _wire_stream(anthropic: MagicMock, response: MagicMock) -> None:
+    """Wire `messages.stream(...).get_final_message()` to return ``response``.
+
+    The shared ``LlmClient`` switched from non-streaming ``messages.create`` to
+    streaming ``messages.stream`` because Opus 4.7 + extended thinking can
+    exceed Anthropic's 10-minute non-streaming SLA. Tests need to mock the
+    streaming context manager rather than the create call.
+    """
+    stream_cm = MagicMock()
+    stream_cm.__enter__.return_value = stream_cm
+    stream_cm.__exit__.return_value = None
+    stream_cm.get_final_message.return_value = response
+    anthropic.messages.stream.return_value = stream_cm
+
+
 # --------------------------------------------------------------------------
 # Fixtures
 # --------------------------------------------------------------------------
@@ -209,7 +224,7 @@ def test_evaluate_makes_one_llm_call_and_caches(
     edgar.fetch_filing_document.return_value = fake_10k_html
 
     anthropic = MagicMock()
-    anthropic.messages.create.return_value = mock_anthropic_response_pass_all
+    _wire_stream(anthropic, mock_anthropic_response_pass_all)
 
     analyzer = FourMsAnalyzer(
         edgar_client=edgar,
@@ -228,7 +243,7 @@ def test_evaluate_makes_one_llm_call_and_caches(
     assert not result1.cached
     assert result2.cached
     # Anthropic called exactly once across both evaluate() calls
-    assert anthropic.messages.create.call_count == 1
+    assert anthropic.messages.stream.call_count == 1
 
 
 def test_evaluate_returns_unable_when_no_10k_before_as_of(
@@ -250,6 +265,7 @@ def test_evaluate_returns_unable_when_no_10k_before_as_of(
     assert result.fiscal_year is None
     assert "No 10-K filed before" in result.meaning.rationale
     anthropic.messages.create.assert_not_called()
+    anthropic.messages.stream.assert_not_called()
 
 
 def test_ticker_masked_uses_different_cache_key(
@@ -269,7 +285,7 @@ def test_ticker_masked_uses_different_cache_key(
     ]
     edgar.fetch_filing_document.return_value = fake_10k_html
     anthropic = MagicMock()
-    anthropic.messages.create.return_value = mock_anthropic_response_pass_all
+    _wire_stream(anthropic, mock_anthropic_response_pass_all)
 
     analyzer = FourMsAnalyzer(
         edgar_client=edgar, anthropic_client=anthropic,
@@ -280,7 +296,7 @@ def test_ticker_masked_uses_different_cache_key(
     analyzer.evaluate("FAKE", as_of=date(2024, 1, 1), ticker_masked=True)
 
     # Two distinct cache entries (different masking) → two LLM calls.
-    assert anthropic.messages.create.call_count == 2
+    assert anthropic.messages.stream.call_count == 2
     cached_files = list((tmp_path / "llm_cache").glob("*.json"))
     assert len(cached_files) == 2
 
@@ -355,7 +371,7 @@ def test_evaluate_handles_string_field_in_response(
     ]
     edgar.fetch_filing_document.return_value = fake_10k_html
     anthropic = MagicMock()
-    anthropic.messages.create.return_value = response
+    _wire_stream(anthropic, response)
 
     analyzer = FourMsAnalyzer(
         edgar_client=edgar, anthropic_client=anthropic,
@@ -386,7 +402,7 @@ def test_cache_payload_is_valid_json(
     ]
     edgar.fetch_filing_document.return_value = fake_10k_html
     anthropic = MagicMock()
-    anthropic.messages.create.return_value = mock_anthropic_response_pass_all
+    _wire_stream(anthropic, mock_anthropic_response_pass_all)
 
     analyzer = FourMsAnalyzer(
         edgar_client=edgar, anthropic_client=anthropic,
