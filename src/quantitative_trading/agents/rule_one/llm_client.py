@@ -159,12 +159,23 @@ class LlmClient:
         user_prompt: str,
         tool: dict[str, Any],
     ) -> dict[str, Any]:
+        # tool_choice nuance: Anthropic forbids combining extended thinking
+        # with a forced specific tool ("Thinking may not be enabled when
+        # tool_choice forces tool use"). When thinking is enabled, fall back
+        # to ``tool_choice: auto`` — since we only ever provide ONE tool, the
+        # model reliably selects it after thinking. When thinking is disabled
+        # (e.g. unit tests), we keep the deterministic forced-tool path.
+        if self._thinking_budget_tokens > 0:
+            tool_choice: dict[str, Any] = {"type": "auto"}
+        else:
+            tool_choice = {"type": "tool", "name": tool["name"]}
+
         kwargs: dict[str, Any] = {
             "model": self._model,
             "max_tokens": self._max_output_tokens,
             "system": system_prompt,
             "tools": [tool],
-            "tool_choice": {"type": "tool", "name": tool["name"]},
+            "tool_choice": tool_choice,
             "messages": [{"role": "user", "content": user_prompt}],
         }
         if self._thinking_budget_tokens > 0:

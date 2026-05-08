@@ -66,7 +66,10 @@ def test_call_invokes_anthropic_with_thinking_enabled() -> None:
     kwargs = anthropic.messages.stream.call_args.kwargs
     assert kwargs["model"] == "claude-opus-4-7"
     assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 10000}
-    assert kwargs["tool_choice"] == {"type": "tool", "name": "submit_test"}
+    # When thinking is enabled, Anthropic disallows forced specific-tool
+    # selection, so we fall back to ``auto`` (the model picks the only tool
+    # we provide).
+    assert kwargs["tool_choice"] == {"type": "auto"}
     anthropic.messages.create.assert_not_called()
 
 
@@ -112,6 +115,8 @@ def test_zero_thinking_budget_omits_thinking_param() -> None:
     llm.call(system_prompt="s", user_prompt="u", tool=_TOOL)
     kwargs = anthropic.messages.stream.call_args.kwargs
     assert "thinking" not in kwargs
+    # With thinking disabled, the deterministic forced-specific-tool path is safe.
+    assert kwargs["tool_choice"] == {"type": "tool", "name": "submit_test"}
 
 
 def test_call_raises_when_no_tool_use_block() -> None:
