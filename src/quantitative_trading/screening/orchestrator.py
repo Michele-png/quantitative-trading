@@ -77,8 +77,16 @@ def _failed_gates(result: AgentResult, policy: HardGatePolicy) -> list[str]:
         failed.append("meaning")
     if policy.require_moat and not llm.get("moat", False):
         failed.append("moat")
-    if policy.require_management and not llm.get("management", False):
-        failed.append("management")
+    # Management uses the dedicated ManagementResult aggregator when
+    # available so partial 4Ms failures don't poison the gate.
+    if policy.require_management:
+        mgmt_passes = (
+            result.management.passes
+            if result.management is not None
+            else llm.get("management", False)
+        )
+        if not mgmt_passes:
+            failed.append("management")
 
     return failed
 
@@ -158,7 +166,14 @@ def _record_from_result(
         rationale_meaning=fm.meaning.rationale if fm is not None else None,
         rationale_moat=fm.moat.rationale if fm is not None else None,
 
-        check_management=fm.management.passes if fm is not None else None,
+        # Prefer the dedicated ManagementResult aggregator when available
+        # (it survives partial 4Ms failures via _safe_eval). Fall back to
+        # the four_ms.management slot only if the management pipeline didn't
+        # run at all.
+        check_management=(
+            mg.passes if mg is not None
+            else (fm.management.passes if fm is not None else None)
+        ),
         check_mgmt_blame=mg.blame.passes if mg is not None else None,
         check_mgmt_long_short=mg.long_short.passes if mg is not None else None,
         check_mgmt_clarity=mg.clarity.passes if mg is not None else None,

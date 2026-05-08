@@ -182,9 +182,13 @@ class LlmClient:
         )
 
     @retry(
+        # Anthropic 'overloaded' errors typically persist for 30-180s, so a
+        # 2-30s backoff is too aggressive. 5 attempts at 4s, 8s, 16s, 32s, 64s
+        # (capped at 120s) gives the best chance of riding out a transient
+        # capacity blip without tying up the workflow forever.
         retry=retry_if_exception_type(Exception),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=2, min=2, max=30),
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=4, min=4, max=120),
         reraise=True,
     )
     def _invoke(
