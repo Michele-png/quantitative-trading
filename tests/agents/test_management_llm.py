@@ -344,6 +344,48 @@ def test_management_passes_only_when_all_five_pass() -> None:
     assert result.blame.passes  # other sub-checks still pass
 
 
+def test_management_one_subcheck_exception_does_not_zero_result(tmp_path: Path) -> None:
+    """If a single sub-check evaluator raises (e.g. LLM streaming error,
+    no parseable JSON, transient 429), the aggregator must still return a
+    ManagementResult with the OTHER sub-checks intact and the failed one
+    surfaced as ``passes=False`` with the exception in its rationale."""
+    edgar = MagicMock()
+    edgar.get_cik.return_value = 999
+    edgar.list_filings.return_value = []  # insider check passes
+    llm = _smart_llm()
+    original_side = llm.call.side_effect
+
+    def raising_compensation(*, system_prompt, user_prompt, tool, dry_run_payload=None):
+        if tool["name"] == "submit_compensation_assessment":
+            raise RuntimeError(
+                "Anthropic returned no tool_use block and no parseable JSON in text"
+            )
+        return original_side(system_prompt=system_prompt,
+                              user_prompt=user_prompt, tool=tool)
+
+    llm.call.side_effect = raising_compensation
+    bundler = MagicMock(spec=DocumentBundler)
+    bundler.build.return_value = _bundle(transcripts=[_transcript()])
+    analyzer = ManagementAnalyzer(
+        edgar_client=edgar, llm_client=llm, document_bundler=bundler,
+        cache_dir=tmp_path / "mgmt_cache_safe",
+    )
+    result = analyzer.evaluate("FAKE", as_of=date(2024, 1, 1))
+
+    # Other sub-checks remain truthful.
+    assert result.blame.passes
+    assert result.long_short.passes
+    assert result.clarity.passes
+    assert result.insider.passes
+    # Compensation degraded gracefully — exists, fails, has the exception
+    # message in its rationale.
+    assert not result.compensation.passes
+    assert "no tool_use" in result.compensation.rationale
+    assert result.compensation.details.get("error") is True
+    # Aggregate still fails (because compensation is required for the AND).
+    assert not result.passes
+
+
 # --------------------------------------------------------------------------
 # DocumentBundler.hash determinism
 # --------------------------------------------------------------------------

@@ -30,7 +30,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from quantitative_trading.agents.rule_one.four_ms_llm import (
     extract_10k_sections,
@@ -104,6 +104,28 @@ class SubCheck:
     score: float | None  # 1..10 for clarity, 0..1 for ratios; None when n/a
     rationale: str
     details: dict[str, Any] = field(default_factory=dict)
+
+
+def _safe_eval(name: str, fn: Callable[[], SubCheck]) -> SubCheck:
+    """Run a sub-check evaluator, swallowing any exception into a fail SubCheck.
+
+    A single LLM failure (e.g., the model writes prose instead of calling
+    the tool, a transient Anthropic 429, a malformed response that fails
+    JSON extraction) shouldn't zero out the whole ManagementResult. The
+    aggregator records the failure on the affected sub-check only and
+    keeps the successful sub-checks.
+    """
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Management sub-check %s failed: %s", name, exc)
+        return SubCheck(
+            name=name,
+            passes=False,
+            score=None,
+            rationale=f"Sub-check failed: {type(exc).__name__}: {exc}"[:1000],
+            details={"error": True, "exception_type": type(exc).__name__},
+        )
 
 
 @dataclass(frozen=True)
@@ -829,14 +851,17 @@ class ManagementAnalyzer:
             except Exception as exc:  # noqa: BLE001 - cache miss on parse failure
                 log.warning("Management cache read failed for %s: %s", ticker, exc)
 
-        # Insider check is cheap and runs first so we can short-circuit obvious
-        # fails on bandwidth-constrained runs (we still run all so the dashboard
-        # has full data, but logging the insider result first helps debugging).
-        insider = self._insider.evaluate(ticker, as_of)
-        blame = self._blame.evaluate(bundle)
-        long_short = self._long_short.evaluate(bundle)
-        clarity = self._clarity.evaluate(bundle)
-        compensation = self._compensation.evaluate(bundle)
+        # Each sub-check is wrapped in try/except so a single LLM failure
+        # (e.g., the model writing prose instead of calling the tool, an
+        # Anthropic 429, a malformed response) doesn't zero out the entire
+        # ManagementResult. The failed sub-check becomes a deterministic
+        # ``passes=False`` SubCheck with the exception in its rationale, and
+        # the dashboard surfaces that as a partial-pass row rather than NULL.
+        insider = _safe_eval("Insider", lambda: self._insider.evaluate(ticker, as_of))
+        blame = _safe_eval("Blame", lambda: self._blame.evaluate(bundle))
+        long_short = _safe_eval("LongShort", lambda: self._long_short.evaluate(bundle))
+        clarity = _safe_eval("Clarity", lambda: self._clarity.evaluate(bundle))
+        compensation = _safe_eval("Compensation", lambda: self._compensation.evaluate(bundle))
 
         result = ManagementResult(
             ticker=ticker.upper(), as_of=as_of,
