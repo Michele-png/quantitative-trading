@@ -401,3 +401,72 @@ def test_bundle_hash_stable_for_same_inputs() -> None:
     b1 = _bundle(mda="A", transcripts=[_transcript()])
     b2 = _bundle(mda="A", transcripts=[_transcript()])
     assert b1.hash() == b2.hash()
+
+
+def test_pre_coverage_cache_backfills_coverage_from_bundle(tmp_path: Path) -> None:
+    """Cache files written before SourceCoverage existed must be hydrated:
+    on cache hit we should rebuild coverage from the freshly-built bundle so
+    the dashboard's source_coverage block populates without paying for new
+    LLM calls."""
+    import json
+
+    from quantitative_trading.agents.rule_one.management_llm import (
+        PROMPT_VERSION,
+        _cache_key,
+        _encode_subcheck,
+    )
+
+    edgar = MagicMock()
+    edgar.get_cik.return_value = 999
+    edgar.list_filings.return_value = []
+
+    llm = _smart_llm()
+    bundle = _bundle(transcripts=[_transcript(), _transcript(q=2)])
+    bundler = MagicMock(spec=DocumentBundler)
+    bundler.build.return_value = bundle
+    bundler._transcript_quarters = 8
+
+    cache_dir = tmp_path / "mgmt_cache_legacy"
+    cache_dir.mkdir(parents=True)
+    cache_path = cache_dir / _cache_key(
+        ticker="FAKE",
+        fiscal_year=bundle.fiscal_year,
+        bundle_hash=bundle.hash(),
+        model=llm.model,
+        thinking_budget=llm.thinking_budget_tokens,
+        prompt_version=PROMPT_VERSION,
+    )
+    legacy_payload = {
+        "blame": _encode_subcheck(SubCheck("Blame", True, 1.0, "ok")),
+        "long_short": _encode_subcheck(
+            SubCheck("LongShort", True, 5.0, "ok", details={"ratio": 5.0}),
+        ),
+        "clarity": _encode_subcheck(SubCheck("Clarity", True, 8.0, "ok")),
+        "compensation": _encode_subcheck(SubCheck("Compensation", True, None, "ok")),
+        "insider": _encode_subcheck(SubCheck(
+            "Insider", True, 100_000.0, "ok",
+            details={"n_transactions": 7,
+                     "net_open_market_value_usd": 100_000.0},
+        )),
+        # NOTE: no "coverage" key — mirrors entries written by older code.
+    }
+    cache_path.write_text(json.dumps(legacy_payload))
+
+    analyzer = ManagementAnalyzer(
+        edgar_client=edgar, llm_client=llm,
+        document_bundler=bundler, cache_dir=cache_dir,
+    )
+    result = analyzer.evaluate("FAKE", as_of=date(2024, 1, 1))
+
+    assert result.cached
+    assert result.coverage is not None
+    assert result.coverage.transcripts_available is True
+    assert result.coverage.transcripts_count == 2
+    assert result.coverage.transcripts_expected == 8
+    assert result.coverage.def14a_compensation_available is True
+    assert result.coverage.mda_available is True
+    # Insider Form 4 availability inferred from the cached SubCheck details.
+    assert result.coverage.form4_available is True
+    assert result.coverage.form4_n_transactions == 7
+    # No new LLM calls — cache served everything.
+    llm.call.assert_not_called()

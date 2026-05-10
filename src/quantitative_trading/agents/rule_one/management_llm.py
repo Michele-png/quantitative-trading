@@ -960,6 +960,22 @@ class ManagementAnalyzer:
         if cache_path.exists() and not self._llm.dry_run:
             try:
                 cached = json.loads(cache_path.read_text())
+                insider = _decode_subcheck(cached["insider"], "Insider")
+                # Coverage was not always cached. When loading a pre-coverage
+                # entry, derive it from the freshly-built bundle. The bundle
+                # content matches the cached entry by definition (same
+                # ``bundle_hash``), so the SourceCoverage we compute now is
+                # identical to what the original run would have produced.
+                # Backfills the dashboard's ``source_coverage`` block + the
+                # PARTIAL_DATA / NO_DATA per-subcheck status without paying
+                # for any new LLM calls.
+                coverage = _decode_coverage(cached.get("coverage"))
+                if coverage is None:
+                    coverage = _build_coverage(
+                        bundle=bundle,
+                        expected_transcripts=expected_transcripts,
+                        insider=insider,
+                    )
                 return ManagementResult(
                     ticker=ticker.upper(), as_of=as_of,
                     fiscal_year=bundle.fiscal_year,
@@ -969,8 +985,8 @@ class ManagementAnalyzer:
                     long_short=_decode_subcheck(cached["long_short"], "LongShort"),
                     clarity=_decode_subcheck(cached["clarity"], "Clarity"),
                     compensation=_decode_subcheck(cached["compensation"], "Compensation"),
-                    insider=_decode_subcheck(cached["insider"], "Insider"),
-                    coverage=_decode_coverage(cached.get("coverage")),
+                    insider=insider,
+                    coverage=coverage,
                 )
             except Exception as exc:  # noqa: BLE001 - cache miss on parse failure
                 log.warning("Management cache read failed for %s: %s", ticker, exc)
