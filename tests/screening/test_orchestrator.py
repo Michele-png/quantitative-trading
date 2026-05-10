@@ -312,3 +312,39 @@ def test_record_includes_management_sub_checks() -> None:
     assert rec.value_mgmt_clarity_score == 8.0
     assert rec.value_mgmt_long_short_ratio == 5.0
     assert rec.value_mgmt_insider_net_usd == 100_000.0
+
+
+def test_record_populates_evidence_blobs() -> None:
+    agent = MagicMock()
+    agent.evaluate.return_value = _agent_result()
+    rec = ScreeningOrchestrator(agent=agent).screen(
+        ["FAKE"], date(2024, 1, 1)
+    )[0]
+
+    assert rec.big_five_evidence["schema_version"] == 1
+    assert set(rec.big_five_evidence["checks"].keys()) == {
+        "roic", "sales_growth", "eps_growth", "equity_growth", "ocf_growth",
+    }
+    # Every Big 5 check has a status string and a yearly series field.
+    for check in rec.big_five_evidence["checks"].values():
+        assert check["status"] in {"pass", "fail", "no_data", "error"}
+        assert "yearly" in check
+
+    assert rec.management_evidence["schema_version"] == 1
+    assert set(rec.management_evidence["subchecks"].keys()) == {
+        "blame", "long_short", "clarity", "compensation", "insider",
+    }
+
+
+def test_error_record_still_carries_evidence_stub() -> None:
+    agent = MagicMock()
+    agent.evaluate.side_effect = RuntimeError("boom")
+    rec = ScreeningOrchestrator(agent=agent).screen(
+        ["FAKE"], date(2024, 1, 1)
+    )[0]
+    assert rec.error == "boom"
+    # Evidence blobs are present but empty so the dashboard never NPEs.
+    assert rec.big_five_evidence["schema_version"] == 1
+    assert rec.big_five_evidence["checks"] == {}
+    assert rec.management_evidence["schema_version"] == 1
+    assert rec.management_evidence["subchecks"] == {}

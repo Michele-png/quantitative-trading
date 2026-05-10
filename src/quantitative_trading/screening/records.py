@@ -127,3 +127,25 @@ class ScreenedRecord:
     # Provenance
     error: str | None = None
     """Short error message if evaluation failed; otherwise None."""
+
+    # Evidence blobs — JSON-serializable dicts that let the dashboard show
+    # "see evidence" drill-downs without forcing a wide-column schema.
+    # Shapes are documented in ``screening/evidence.py``. Default to empty
+    # dicts so error rows and tests that build ``ScreenedRecord`` directly
+    # remain valid; orchestrator-built records always populate them.
+    big_five_evidence: dict[str, Any] = field(default_factory=dict)
+    """Per-Big-5-check yearly series, calculation method, and data-window status.
+
+    Schema:
+        ``{"schema_version": 1, "as_of": "...", "latest_fiscal_year": int|None,
+        "n_years_target": 10, "checks": {<key>: {...}}, "current_ratio": {...}}``
+    """
+
+    management_evidence: dict[str, Any] = field(default_factory=dict)
+    """Per-subcheck evidence + source coverage for the Management pillar.
+
+    Schema:
+        ``{"schema_version": 1, "as_of": "...", "fiscal_year": int|None,
+        "model": str, "cached": bool, "bundle_hash": str|None,
+        "source_coverage": {...}, "subchecks": {<key>: {...}}}``
+    """

@@ -30,6 +30,10 @@ from quantitative_trading.config import get_config
 from quantitative_trading.data.edgar import EdgarClient
 from quantitative_trading.data.prices import PriceClient
 from quantitative_trading.data.transcripts import TranscriptProvider
+from quantitative_trading.screening.evidence import (
+    build_big_five_evidence,
+    build_management_evidence,
+)
 from quantitative_trading.screening.records import (
     HardGatePolicy,
     ScreenedRecord,
@@ -196,6 +200,11 @@ def _record_from_result(
         margin_of_safety_price=sp.margin_of_safety_price if include_mos else None,
         current_price=sp.current_price if include_mos else None,
         mos_percent=mos_percent if include_mos else None,
+
+        big_five_evidence=build_big_five_evidence(b5),
+        management_evidence=build_management_evidence(
+            management=mg, four_ms=fm,
+        ),
     )
 
 
@@ -220,6 +229,10 @@ def _error_record(ticker: str, as_of: date, error: str) -> ScreenedRecord:
         value_mgmt_clarity_score=None, value_mgmt_long_short_ratio=None,
         value_mgmt_insider_net_usd=None, rationale_management=None,
         screen_passes=False, failed_gates=["evaluation_error"], error=error,
+        big_five_evidence=build_big_five_evidence(None),
+        management_evidence=build_management_evidence(
+            management=None, four_ms=None,
+        ),
     )
 
 

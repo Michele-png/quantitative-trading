@@ -129,6 +129,33 @@ def _safe_eval(name: str, fn: Callable[[], SubCheck]) -> SubCheck:
 
 
 @dataclass(frozen=True)
+class SourceCoverage:
+    """Snapshot of which Management input documents were available for a run.
+
+    Populated by ``ManagementAnalyzer.evaluate`` from the assembled
+    ``DocumentBundle`` (and the insider sub-check's outcome). The dashboard
+    uses this to distinguish a real "bad management signal" failure from
+    "we couldn't evaluate this leg because the source was missing".
+
+    ``shareholder_letter_source`` is one of:
+        * ``"def14a"`` — the proxy statement contained an explicit letter.
+        * ``"10-k_item1_fallback"`` — fell back to the 10-K Item 1 text.
+        * ``None`` — no shareholder letter material was found.
+    """
+
+    transcripts_available: bool = False
+    transcripts_count: int = 0
+    transcripts_expected: int = 0
+    def14a_compensation_available: bool = False
+    def14a_letter_available: bool = False
+    shareholder_letter_available: bool = False
+    shareholder_letter_source: str | None = None
+    mda_available: bool = False
+    form4_available: bool = False
+    form4_n_transactions: int | None = None
+
+
+@dataclass(frozen=True)
 class ManagementResult:
     """Aggregate Management evaluation."""
 
@@ -144,6 +171,14 @@ class ManagementResult:
     clarity: SubCheck
     compensation: SubCheck
     insider: SubCheck
+
+    coverage: SourceCoverage | None = None
+    """Which source documents were available for this run.
+
+    ``None`` only when the result was hydrated from a pre-coverage cache
+    file (older runs). Fresh runs always populate this so the dashboard
+    can distinguish ``no_data`` from ``fail`` per sub-check.
+    """
 
     @property
     def passes(self) -> bool:
@@ -802,6 +837,86 @@ def _encode_subcheck(sub: SubCheck) -> dict[str, Any]:
     }
 
 
+def _encode_coverage(coverage: SourceCoverage | None) -> dict[str, Any] | None:
+    if coverage is None:
+        return None
+    return {
+        "transcripts_available": coverage.transcripts_available,
+        "transcripts_count": coverage.transcripts_count,
+        "transcripts_expected": coverage.transcripts_expected,
+        "def14a_compensation_available": coverage.def14a_compensation_available,
+        "def14a_letter_available": coverage.def14a_letter_available,
+        "shareholder_letter_available": coverage.shareholder_letter_available,
+        "shareholder_letter_source": coverage.shareholder_letter_source,
+        "mda_available": coverage.mda_available,
+        "form4_available": coverage.form4_available,
+        "form4_n_transactions": coverage.form4_n_transactions,
+    }
+
+
+def _decode_coverage(payload: dict[str, Any] | None) -> SourceCoverage | None:
+    """Hydrate ``SourceCoverage`` from a cache payload.
+
+    Returns ``None`` for cache files written before coverage tracking
+    existed so the dashboard can render an "unknown coverage" state until
+    the next refresh repopulates the entry.
+    """
+    if not payload or not isinstance(payload, dict):
+        return None
+    return SourceCoverage(
+        transcripts_available=bool(payload.get("transcripts_available", False)),
+        transcripts_count=int(payload.get("transcripts_count", 0) or 0),
+        transcripts_expected=int(payload.get("transcripts_expected", 0) or 0),
+        def14a_compensation_available=bool(
+            payload.get("def14a_compensation_available", False)
+        ),
+        def14a_letter_available=bool(payload.get("def14a_letter_available", False)),
+        shareholder_letter_available=bool(
+            payload.get("shareholder_letter_available", False)
+        ),
+        shareholder_letter_source=payload.get("shareholder_letter_source"),
+        mda_available=bool(payload.get("mda_available", False)),
+        form4_available=bool(payload.get("form4_available", False)),
+        form4_n_transactions=payload.get("form4_n_transactions"),
+    )
+
+
+def _build_coverage(
+    *, bundle: DocumentBundle, expected_transcripts: int, insider: SubCheck,
+) -> SourceCoverage:
+    """Capture which source documents were available for this evaluation.
+
+    Insider/Form 4 availability is derived from the insider sub-check's
+    ``details``: a successful Form 4 fetch leaves ``n_transactions`` in
+    details (see ``InsiderAlignmentEvaluator``), while a fetch failure
+    leaves only an error rationale.
+    """
+    if bundle.def14a_letter_text:
+        letter_source = "def14a"
+    elif bundle.shareholder_letter_text:
+        letter_source = "10-k_item1_fallback"
+    else:
+        letter_source = None
+
+    insider_details = insider.details or {}
+    insider_errored = bool(insider_details.get("error"))
+    n_txns = insider_details.get("n_transactions")
+    form4_available = (not insider_errored) and isinstance(n_txns, int)
+
+    return SourceCoverage(
+        transcripts_available=len(bundle.transcripts) > 0,
+        transcripts_count=len(bundle.transcripts),
+        transcripts_expected=expected_transcripts,
+        def14a_compensation_available=bool(bundle.def14a_compensation_text),
+        def14a_letter_available=bool(bundle.def14a_letter_text),
+        shareholder_letter_available=bool(bundle.shareholder_letter_text),
+        shareholder_letter_source=letter_source,
+        mda_available=bool(bundle.mda_text),
+        form4_available=form4_available,
+        form4_n_transactions=n_txns if isinstance(n_txns, int) else None,
+    )
+
+
 class ManagementAnalyzer:
     """End-to-end Management evaluator with disk caching."""
 
@@ -827,6 +942,14 @@ class ManagementAnalyzer:
     def evaluate(self, ticker: str, as_of: date) -> ManagementResult:
         bundle = self._bundler.build(ticker, as_of)
         bundle_hash = bundle.hash()
+        # ``DocumentBundler`` stores its transcript-quarter target on
+        # ``_transcript_quarters``; fall back to the module default so the
+        # dashboard still gets a sensible "expected" count if the attribute
+        # is ever renamed.
+        expected_transcripts = int(
+            getattr(self._bundler, "_transcript_quarters",
+                    DEFAULT_TRANSCRIPT_QUARTERS)
+        )
         cache_path = self._cache_dir / _cache_key(
             ticker=ticker, fiscal_year=bundle.fiscal_year,
             bundle_hash=bundle_hash,
@@ -847,6 +970,7 @@ class ManagementAnalyzer:
                     clarity=_decode_subcheck(cached["clarity"], "Clarity"),
                     compensation=_decode_subcheck(cached["compensation"], "Compensation"),
                     insider=_decode_subcheck(cached["insider"], "Insider"),
+                    coverage=_decode_coverage(cached.get("coverage")),
                 )
             except Exception as exc:  # noqa: BLE001 - cache miss on parse failure
                 log.warning("Management cache read failed for %s: %s", ticker, exc)
@@ -863,6 +987,12 @@ class ManagementAnalyzer:
         clarity = _safe_eval("Clarity", lambda: self._clarity.evaluate(bundle))
         compensation = _safe_eval("Compensation", lambda: self._compensation.evaluate(bundle))
 
+        coverage = _build_coverage(
+            bundle=bundle,
+            expected_transcripts=expected_transcripts,
+            insider=insider,
+        )
+
         result = ManagementResult(
             ticker=ticker.upper(), as_of=as_of,
             fiscal_year=bundle.fiscal_year,
@@ -870,6 +1000,7 @@ class ManagementAnalyzer:
             model=self._llm.model, cached=False,
             blame=blame, long_short=long_short, clarity=clarity,
             compensation=compensation, insider=insider,
+            coverage=coverage,
         )
         if not self._llm.dry_run:
             cache_path.write_text(json.dumps({
@@ -878,5 +1009,6 @@ class ManagementAnalyzer:
                 "clarity": _encode_subcheck(clarity),
                 "compensation": _encode_subcheck(compensation),
                 "insider": _encode_subcheck(insider),
+                "coverage": _encode_coverage(coverage),
             }, indent=2))
         return result
