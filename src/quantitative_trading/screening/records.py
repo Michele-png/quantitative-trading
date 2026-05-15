@@ -104,9 +104,11 @@ class ScreenedRecord:
     check_mgmt_clarity: bool | None
     check_mgmt_compensation: bool | None
     check_mgmt_insider: bool | None
+    check_mgmt_capital_allocation: bool | None
     value_mgmt_clarity_score: float | None
     value_mgmt_long_short_ratio: float | None
     value_mgmt_insider_net_usd: float | None
+    value_mgmt_capital_allocation_score: float | None
     rationale_management: str | None
 
     # Decision

@@ -120,6 +120,15 @@ def _build_facts(years: list[int], series_by_concept: dict[str, list[float]]) ->
                          "AssetsCurrent", "LiabilitiesCurrent"):
             unit = "USD"
             is_flow = False
+        elif concept in (
+            "WeightedAverageNumberOfDilutedSharesOutstanding",
+            "WeightedAverageNumberOfSharesOutstandingBasic",
+            "CommonStockSharesOutstanding",
+        ):
+            # Share counts are flow-style in XBRL (have start/end) and
+            # carry the ``shares`` unit, not ``USD``.
+            unit = "shares"
+            is_flow = True
         else:
             unit = "USD"
             is_flow = True
@@ -234,11 +243,14 @@ def test_company_with_negative_starting_equity_eps_growth_fails(
     assert "ill-defined" in result.eps_growth.rationale
 
 
-def test_growth_with_partial_history_uses_available_window(
+def test_growth_with_partial_history_does_not_pass_decision_grade(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Company with only 7y of XBRL data (typical for older companies before
-    XBRL mandate) should still pass if CAGR ≥ threshold."""
+    """Phil Town's rule wants 10 years; 7 years of data must not be a
+    decision-grade pass. The metric still surfaces the underlying CAGR
+    (so the dashboard can show "would have been X%") but ``passes`` is
+    False until the window is full.
+    """
     years = list(range(2017, 2024))  # 7 years
     rev = [100 * 1.15 ** i for i in range(7)]
     facts = _build_facts(
@@ -256,12 +268,17 @@ def test_growth_with_partial_history_uses_available_window(
     )
     analyzer = _make_analyzer_with_facts(facts, monkeypatch)
     result = analyzer.evaluate("FAKE", as_of=date(2025, 6, 1), n_years=10)
-    assert result.sales_growth.passes
-    assert "NOTE: only 7y data" in result.sales_growth.rationale
+    # Underlying CAGR is well above 10% — but decision-grade pass is
+    # blocked because we're missing 3 years of evidence.
+    assert result.sales_growth.value is not None
+    assert result.sales_growth.value >= 0.10
+    assert not result.sales_growth.passes
+    assert not result.sales_growth.decision_grade
+    assert "decision-grade pass requires the full window" in result.sales_growth.rationale
 
 
-def test_growth_fails_with_too_few_years(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Less than min_years (default 5) of data → growth metrics fail."""
+def test_growth_value_is_none_below_min_years(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With <5 populated years we don't even compute a CAGR — too noisy."""
     years = list(range(2021, 2024))  # 3 years only
     rev = [100 * 1.15 ** i for i in range(3)]
     facts = _build_facts(
@@ -279,8 +296,107 @@ def test_growth_fails_with_too_few_years(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     analyzer = _make_analyzer_with_facts(facts, monkeypatch)
     result = analyzer.evaluate("FAKE", as_of=date(2025, 6, 1), n_years=10)
+    assert result.sales_growth.value is None
     assert not result.sales_growth.passes
+    assert not result.sales_growth.decision_grade
     assert "need ≥ 5" in result.sales_growth.rationale
+
+
+def test_full_10y_window_is_decision_grade(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Full 10-year window with passing CAGR sets ``decision_grade=True``."""
+    years = list(range(2014, 2024))
+    rev = [100 * 1.15 ** i for i in range(10)]
+    facts = _build_facts(
+        years,
+        {
+            "Revenues": rev,
+            "NetIncomeLoss": [10 * 1.15 ** i for i in range(10)],
+            "EarningsPerShareDiluted": [1.0 * 1.15 ** i for i in range(10)],
+            "StockholdersEquity": [50 * 1.15 ** i for i in range(10)],
+            "NetCashProvidedByUsedInOperatingActivities": [12 * 1.15 ** i for i in range(10)],
+            "LongTermDebtNoncurrent": [20] * 10,
+            "AssetsCurrent": [100] * 10,
+            "LiabilitiesCurrent": [40] * 10,
+        },
+    )
+    analyzer = _make_analyzer_with_facts(facts, monkeypatch)
+    result = analyzer.evaluate("FAKE", as_of=date(2025, 6, 1), n_years=10)
+    assert result.sales_growth.passes
+    assert result.sales_growth.decision_grade
+    assert result.roic.passes
+    assert result.roic.decision_grade
+
+
+def test_eps_falls_back_to_ni_div_shares_when_concept_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issuer that omits ``EarningsPerShareDiluted`` but reports both
+    ``NetIncomeLoss`` and ``WeightedAverageNumberOfDilutedSharesOutstanding``
+    (e.g. companies that only tag the components, not the ratio) should
+    still get a populated EPS series via the SEC NI/shares fallback.
+    """
+    years = list(range(2014, 2024))
+    ni_vals = [10_000_000 * 1.15 ** i for i in range(10)]
+    sh_vals = [1_000_000.0] * 10  # constant share count → EPS grows like NI
+    facts = _build_facts(
+        years,
+        {
+            "Revenues": [100 * 1.15 ** i for i in range(10)],
+            "NetIncomeLoss": ni_vals,
+            # NB: no EarningsPerShareDiluted at all — the primary concept
+            # is missing, mirroring Visa's actual XBRL profile.
+            "WeightedAverageNumberOfDilutedSharesOutstanding": sh_vals,
+            "StockholdersEquity": [50_000_000 * 1.15 ** i for i in range(10)],
+            "NetCashProvidedByUsedInOperatingActivities": [
+                12_000_000 * 1.15 ** i for i in range(10)
+            ],
+            "LongTermDebtNoncurrent": [20_000_000] * 10,
+            "AssetsCurrent": [100_000_000] * 10,
+            "LiabilitiesCurrent": [40_000_000] * 10,
+        },
+    )
+    analyzer = _make_analyzer_with_facts(facts, monkeypatch)
+    result = analyzer.evaluate("FAKE", as_of=date(2025, 6, 1), n_years=10)
+    # EPS is recovered: NI / shares grows at 15%/yr like NI.
+    assert result.eps_growth.value is not None
+    assert result.eps_growth.value == pytest.approx(0.15, abs=0.01)
+    assert result.eps_growth.passes
+    assert result.eps_growth.data_source == "sec_ni_over_shares"
+
+
+def test_eps_marked_unavailable_when_no_source_has_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When neither EPS nor NI/shares are tagged in XBRL and yfinance is
+    stubbed empty, the EPS metric reports value=None and
+    ``data_source='unavailable'`` so the dashboard can show NO DATA.
+    """
+    years = list(range(2014, 2024))
+    facts = _build_facts(
+        years,
+        {
+            "Revenues": [100 * 1.15 ** i for i in range(10)],
+            # Intentional gap: no NI either (so the NI/shares fallback
+            # also returns nothing).
+            "StockholdersEquity": [50 * 1.15 ** i for i in range(10)],
+            "NetCashProvidedByUsedInOperatingActivities": [
+                12 * 1.15 ** i for i in range(10)
+            ],
+            "LongTermDebtNoncurrent": [20] * 10,
+            "AssetsCurrent": [100] * 10,
+            "LiabilitiesCurrent": [40] * 10,
+        },
+    )
+    analyzer = _make_analyzer_with_facts(facts, monkeypatch)
+    # Stub the yfinance fallback — tests must never hit the network.
+    monkeypatch.setattr(
+        "quantitative_trading.agents.rule_one.big_five._yfinance_eps_series",
+        lambda *args, **kwargs: {},
+    )
+    result = analyzer.evaluate("FAKE", as_of=date(2025, 6, 1), n_years=10)
+    assert result.eps_growth.value is None
+    assert not result.eps_growth.passes
+    assert result.eps_growth.data_source == "unavailable"
 
 
 def test_current_ratio_threshold(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -183,6 +183,11 @@ def _record_from_result(
         check_mgmt_clarity=mg.clarity.passes if mg is not None else None,
         check_mgmt_compensation=mg.compensation.passes if mg is not None else None,
         check_mgmt_insider=mg.insider.passes if mg is not None else None,
+        check_mgmt_capital_allocation=(
+            mg.capital_allocation.passes
+            if mg is not None and mg.capital_allocation is not None
+            else None
+        ),
         value_mgmt_clarity_score=mg.clarity.score if mg is not None else None,
         value_mgmt_long_short_ratio=(
             mg.long_short.details.get("ratio") if mg is not None else None
@@ -190,6 +195,11 @@ def _record_from_result(
         value_mgmt_insider_net_usd=(
             mg.insider.details.get("net_open_market_value_usd")
             if mg is not None else None
+        ),
+        value_mgmt_capital_allocation_score=(
+            mg.capital_allocation.score
+            if mg is not None and mg.capital_allocation is not None
+            else None
         ),
         rationale_management=mg.summary() if mg is not None else None,
 
@@ -226,8 +236,11 @@ def _error_record(ticker: str, as_of: date, error: str) -> ScreenedRecord:
         check_management=None, check_mgmt_blame=None,
         check_mgmt_long_short=None, check_mgmt_clarity=None,
         check_mgmt_compensation=None, check_mgmt_insider=None,
+        check_mgmt_capital_allocation=None,
         value_mgmt_clarity_score=None, value_mgmt_long_short_ratio=None,
-        value_mgmt_insider_net_usd=None, rationale_management=None,
+        value_mgmt_insider_net_usd=None,
+        value_mgmt_capital_allocation_score=None,
+        rationale_management=None,
         screen_passes=False, failed_gates=["evaluation_error"], error=error,
         big_five_evidence=build_big_five_evidence(None),
         management_evidence=build_management_evidence(

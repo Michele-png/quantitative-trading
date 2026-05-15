@@ -166,27 +166,55 @@ def _txn(
 
 
 def test_summarize_passes_with_net_buys_and_no_recent_sells() -> None:
+    """Meaningful insider buying ($25k+) is the positive signal."""
     txns = [
-        _txn(name="CEO", code="P", shares=100, price=50, on=date(2024, 1, 10)),
-        _txn(name="CFO", code="P", shares=50, price=50, on=date(2024, 1, 20), role="cfo"),
-        _txn(name="DIR", code="P", shares=20, price=50, on=date(2024, 2, 1),
+        # 100 + 50 + 20 shares × $500 = $85k notional, well above the $25k threshold.
+        _txn(name="CEO", code="P", shares=100, price=500, on=date(2024, 1, 10)),
+        _txn(name="CFO", code="P", shares=50, price=500, on=date(2024, 1, 20), role="cfo"),
+        _txn(name="DIR", code="P", shares=20, price=500, on=date(2024, 2, 1),
              role="director"),
     ]
     res = summarize_insider_alignment(txns, as_of=date(2024, 6, 1))
     assert res.passes
     assert res.coordinated_buy
     assert res.coordinated_buy_count >= 3
-    assert res.net_open_market_value_usd == pytest.approx(170 * 50)
+    assert res.net_open_market_value_usd == pytest.approx(170 * 500)
 
 
-def test_summarize_excludes_10b5_1_plan_sells_from_signal() -> None:
+def test_summarize_fails_on_zero_net_activity_no_buys() -> None:
+    """A 10b5-1 plan SELL is excluded as signal — but absence of buying
+    is no longer a clean PASS. Phil Town's "skin in the game" requires
+    *meaningful insider buying*; "no real signal" should fail."""
     txns = [
         _txn(name="CEO", code="S", shares=10_000, price=100, on=date(2024, 5, 15),
              plan=True),
     ]
     res = summarize_insider_alignment(txns, as_of=date(2024, 6, 1))
     assert res.open_market_sell_value_usd == 0  # plan sells excluded
-    assert res.passes  # no real signal at all → passes (net = 0, no large recent sells)
+    assert not res.passes
+    assert "lack of qualifying insider buying" not in res.rationale  # has activity
+    # The threshold-based rationale should mention $25k.
+    assert "≥ $25k" in res.rationale
+
+
+def test_summarize_fails_below_min_net_buy_threshold() -> None:
+    """$8k of buying is not enough to call the alignment check a PASS."""
+    txns = [
+        _txn(name="CEO", code="P", shares=160, price=50, on=date(2024, 1, 10)),  # $8k
+    ]
+    res = summarize_insider_alignment(txns, as_of=date(2024, 6, 1))
+    assert res.net_open_market_value_usd == pytest.approx(8_000.0)
+    assert not res.passes
+
+
+def test_summarize_passes_at_threshold_buying() -> None:
+    """At-or-above the threshold is the boundary."""
+    txns = [
+        _txn(name="CEO", code="P", shares=500, price=50, on=date(2024, 1, 10)),  # $25k
+    ]
+    res = summarize_insider_alignment(txns, as_of=date(2024, 6, 1))
+    assert res.net_open_market_value_usd == pytest.approx(25_000.0)
+    assert res.passes
 
 
 def test_summarize_fails_on_large_recent_non_plan_sells() -> None:
@@ -199,6 +227,8 @@ def test_summarize_fails_on_large_recent_non_plan_sells() -> None:
 
 
 def test_summarize_ignores_taxes_and_grants_and_gifts() -> None:
+    """Non-economic codes don't count as buying — and without real buys
+    the alignment check fails (rather than passing on $0 net)."""
     txns = [
         _txn(name="CEO", code="A", shares=10_000, price=50, on=date(2024, 1, 10)),  # award
         _txn(name="CEO", code="F", shares=2_000, price=50, on=date(2024, 1, 11)),  # tax
@@ -208,10 +238,12 @@ def test_summarize_ignores_taxes_and_grants_and_gifts() -> None:
     res = summarize_insider_alignment(txns, as_of=date(2024, 6, 1))
     assert res.open_market_buy_value_usd == 0
     assert res.open_market_sell_value_usd == 0
-    assert res.passes
+    assert not res.passes
 
 
 def test_summarize_window_excludes_old_transactions() -> None:
+    """Transactions outside the window are dropped — and an empty window
+    fails for lack of qualifying insider buying."""
     txns = [
         _txn(name="CEO", code="S", shares=200_000, price=50, on=date(2018, 1, 1)),
     ]
@@ -219,7 +251,8 @@ def test_summarize_window_excludes_old_transactions() -> None:
         txns, as_of=date(2024, 6, 1), lookback_months=24,
     )
     assert res.n_transactions == 0
-    assert res.passes
+    assert not res.passes
+    assert "absence of selling is not a positive signal" in res.rationale
 
 
 # --------------------------------------------------------------------------

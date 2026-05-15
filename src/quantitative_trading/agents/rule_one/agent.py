@@ -37,6 +37,8 @@ from quantitative_trading.agents.rule_one.four_ms_llm import (
 )
 from quantitative_trading.agents.rule_one.llm_client import LlmClient
 from quantitative_trading.agents.rule_one.management_llm import (
+    CapitalAllocationContext,
+    DocumentBundler,
     ManagementAnalyzer,
     ManagementResult,
 )
@@ -45,14 +47,23 @@ from quantitative_trading.agents.rule_one.quant_extras import (
     QuantExtrasResult,
 )
 from quantitative_trading.agents.rule_one.sticker_price import (
+    DEFAULT_PE_LOOKBACK_YEARS,
     PaybackTimeResult,
     StickerPriceCalculator,
     StickerPriceResult,
 )
 from quantitative_trading.data.edgar import EdgarClient
+from quantitative_trading.data.management_documents import ArchiveBackedManagementProvider
+from quantitative_trading.data.pit_facts import PointInTimeFacts
 from quantitative_trading.data.prices import PriceClient
 from quantitative_trading.data.transcripts import TranscriptProvider
 
+# Used by the agent's ``_fiscal_year_ends_from_facts`` helper when
+# building the FY → period-end dict it forwards to the sticker
+# calculator. The sticker calculator will average over up to
+# ``DEFAULT_PE_LOOKBACK_YEARS`` of valid FYs, so we materialise a
+# slightly larger window here just in case some FYs are unpriceable.
+DEFAULT_PE_LOOKBACK_YEARS_FOR_AGENT = DEFAULT_PE_LOOKBACK_YEARS + 2
 
 log = logging.getLogger(__name__)
 
@@ -211,6 +222,7 @@ class RuleOneAgent:
         *,
         llm_client: LlmClient | None = None,
         transcript_provider: TranscriptProvider | None = None,
+        management_archive_provider: ArchiveBackedManagementProvider | None = None,
     ) -> None:
         self._edgar = edgar_client
         self._prices = price_client
@@ -233,14 +245,13 @@ class RuleOneAgent:
             self._four_ms = FourMsAnalyzer(
                 edgar_client=edgar_client, llm_client=self._llm,
             )
-            from quantitative_trading.agents.rule_one.management_llm import (
-                DocumentBundler,
-            )
-            bundler = (
-                DocumentBundler(edgar_client, transcript_provider=transcript_provider)
-                if transcript_provider is not None
-                else None
-            )
+            bundler = None
+            if transcript_provider is not None or management_archive_provider is not None:
+                bundler = DocumentBundler(
+                    edgar_client,
+                    transcript_provider=transcript_provider,
+                    archive_provider=management_archive_provider,
+                )
             self._management = ManagementAnalyzer(
                 edgar_client=edgar_client, llm_client=self._llm,
                 document_bundler=bundler,
@@ -259,6 +270,70 @@ class RuleOneAgent:
             edgar_client=self._edgar, llm_client=self._llm,
         )
 
+    def _build_capital_allocation_context(
+        self,
+        big_five: BigFiveResult,
+        quant_extras: QuantExtrasResult | None,
+    ) -> CapitalAllocationContext:
+        """Materialise the capital-allocation evidence the management
+        evaluator needs from already-computed Big 5 + quant extras.
+
+        Keeping this in the agent (instead of re-running PIT facts in
+        the management module) avoids duplicate XBRL reads and ensures
+        the capital-allocation sub-check sees exactly the same numbers
+        the dashboard's Quant Extras section is showing.
+        """
+        if quant_extras is None:
+            return CapitalAllocationContext(
+                roic_series=dict(big_five.roic.series or {}),
+            )
+        # FCF conversion = OCF / NI for the latest FY both have data.
+        fcf_conv = self._latest_fcf_conversion(big_five)
+        return CapitalAllocationContext(
+            dilution_cagr=quant_extras.dilution.value,
+            roic_series=dict(big_five.roic.series or {}),
+            fcf_conversion_latest=fcf_conv,
+            dividend_quality_passes=quant_extras.dividend_quality.passes,
+        )
+
+    @staticmethod
+    def _latest_fcf_conversion(big_five: BigFiveResult) -> float | None:
+        """Approximate FCF conversion using OCF series / ROIC denominator
+        is impossible from Big 5 alone — but we have the OCF series.
+        Net income lives behind ROIC, not directly exposed; until the
+        agent gets a structured PIT view, return ``None`` so the
+        deterministic check skips the FCF leg cleanly. The capital
+        allocation evaluator already treats ``None`` as "no signal"."""
+        return None
+
+    def _fiscal_year_ends_from_facts(
+        self, ticker: str, as_of: date,
+    ) -> dict[int, date | None]:
+        """Map fiscal year → official period-end date for the recent window.
+
+        Used by the sticker calculator to look up FY-end Close prices so
+        it can compute a historical average PE. Returns ``{}`` if EDGAR
+        access fails — the calculator is robust to a missing mapping
+        (it just skips the historical-PE input).
+        """
+        try:
+            cik = self._edgar.get_cik(ticker)
+            facts = self._edgar.get_company_facts(cik)
+            pit = PointInTimeFacts(facts)
+            latest_fy = pit.latest_fiscal_year_with_data("revenue", as_of)
+            if latest_fy is None:
+                return {}
+            window = range(
+                latest_fy - DEFAULT_PE_LOOKBACK_YEARS_FOR_AGENT + 1,
+                latest_fy + 1,
+            )
+            return {fy: pit.fiscal_year_end(fy) for fy in window}
+        except Exception as exc:  # noqa: BLE001 - non-critical helper
+            log.warning(
+                "fiscal_year_ends lookup failed for %s: %s", ticker, exc,
+            )
+            return {}
+
     def evaluate(
         self,
         ticker: str,
@@ -271,8 +346,19 @@ class RuleOneAgent:
     ) -> AgentResult:
         big_five = self._b5.evaluate(ticker, as_of)
         eps_growth = big_five.eps_growth.value  # may be None if insufficient data
+
+        # Pass the EPS-in-today's-basis history + per-FY end dates from
+        # the Big 5 layer down to the sticker calculator. The latter
+        # uses them to compute a historical average PE — one of the
+        # documented inputs to the future-PE cap.
+        eps_history = dict(big_five.eps_growth.series or {})
+        fiscal_year_ends = self._fiscal_year_ends_from_facts(ticker, as_of)
+
         sticker, payback = self._sp.evaluate(
-            ticker, as_of, historical_eps_growth=eps_growth
+            ticker, as_of,
+            historical_eps_growth=eps_growth,
+            eps_history=eps_history,
+            fiscal_year_ends=fiscal_year_ends,
         )
 
         quant_extras: QuantExtrasResult | None = None
@@ -297,8 +383,14 @@ class RuleOneAgent:
 
         management: ManagementResult | None = None
         if include_llm and include_management and self._management is not None:
+            cap_alloc_ctx = self._build_capital_allocation_context(
+                big_five=big_five, quant_extras=quant_extras,
+            )
             try:
-                management = self._management.evaluate(ticker, as_of)
+                management = self._management.evaluate(
+                    ticker, as_of,
+                    capital_allocation_context=cap_alloc_ctx,
+                )
             except Exception as exc:  # noqa: BLE001
                 log.warning("Management LLM failed for %s @ %s: %s",
                             ticker, as_of, exc)

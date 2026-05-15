@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -10,7 +11,10 @@ import pytest
 
 from quantitative_trading.agents.rule_one.llm_client import LlmCallResult, LlmClient
 from quantitative_trading.agents.rule_one.management_llm import (
+    PROMPT_VERSION,
     BlameEvaluator,
+    CapitalAllocationContext,
+    CapitalAllocationEvaluator,
     ClarityEvaluator,
     CompensationEvaluator,
     DocumentBundle,
@@ -19,8 +23,14 @@ from quantitative_trading.agents.rule_one.management_llm import (
     LongShortEvaluator,
     ManagementAnalyzer,
     SubCheck,
+    _cache_key,
+    _encode_subcheck,
 )
 from quantitative_trading.config import get_config
+from quantitative_trading.data.management_documents import (
+    ArchiveBackedManagementProvider,
+    ArchivedManagementDocument,
+)
 from quantitative_trading.data.transcripts import EarningsTranscript
 
 
@@ -204,14 +214,93 @@ def test_compensation_fails_with_no_def14a_text() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_insider_evaluator_calls_summarizer_via_edgar() -> None:
+def test_insider_evaluator_fails_with_no_qualifying_buys() -> None:
+    """No transactions → no qualifying open-market buys → fail.
+
+    Phil Town's ``skin in the game`` requires *meaningful insider
+    buying*, not the absence of selling. The evaluator now refuses to
+    pass on a $0-net result.
+    """
     edgar = MagicMock()
     edgar.get_cik.return_value = 999
     edgar.list_filings.return_value = []  # no insider trades found
     sub = InsiderAlignmentEvaluator(edgar).evaluate("FAKE", date(2024, 1, 1))
-    # No transactions → net 0 → passes (no large recent sells either)
-    assert sub.passes
+    assert not sub.passes
     assert sub.details["n_transactions"] == 0
+    assert "lack of qualifying insider buying" in sub.rationale
+
+
+# --------------------------------------------------------------------------
+# CapitalAllocationEvaluator (Phase 5)
+# --------------------------------------------------------------------------
+
+
+def test_capital_allocation_passes_with_clean_signals() -> None:
+    """Buybacks + high ROIC + good FCF conv + clean LLM = clean PASS."""
+    llm = _make_llm({
+        "stated_priorities": ["reinvestment", "buybacks"],
+        "discipline_score": 9,
+        "capital_misallocation_flags": [],
+        "rationale": "ok",
+    })
+    bundle = _bundle()
+    ctx = CapitalAllocationContext(
+        dilution_cagr=-0.01,  # buybacks
+        roic_series={2014 + i: 0.18 for i in range(10)},
+        fcf_conversion_latest=1.05,
+        dividend_quality_passes=True,
+    )
+    sub = CapitalAllocationEvaluator(llm).evaluate(bundle, ctx)
+    assert sub.passes
+    assert sub.score == 9.0
+    assert sub.details["buyback_discipline"] == "buybacks"
+    assert sub.details["deterministic_concerns"] == []
+
+
+def test_capital_allocation_fails_on_dilution_above_threshold() -> None:
+    """Even a 10/10 LLM read can't rescue a dilution problem."""
+    llm = _make_llm({
+        "stated_priorities": ["growth"], "discipline_score": 10,
+        "capital_misallocation_flags": [], "rationale": "ok",
+    })
+    ctx = CapitalAllocationContext(
+        dilution_cagr=0.05,  # 5% dilution
+        roic_series={2014 + i: 0.18 for i in range(10)},
+    )
+    sub = CapitalAllocationEvaluator(llm).evaluate(_bundle(), ctx)
+    assert not sub.passes
+    assert any(
+        "dilution" in c.lower()
+        for c in sub.details["deterministic_concerns"]
+    )
+
+
+def test_capital_allocation_fails_on_low_llm_discipline() -> None:
+    """Deterministic clean but LLM flags empire-building → fail."""
+    llm = _make_llm({
+        "stated_priorities": ["growth at any cost"],
+        "discipline_score": 4,
+        "capital_misallocation_flags": ["M&A at peak multiples"],
+        "rationale": "concerning",
+    })
+    ctx = CapitalAllocationContext(
+        dilution_cagr=-0.01, roic_series={2014 + i: 0.20 for i in range(10)},
+    )
+    sub = CapitalAllocationEvaluator(llm).evaluate(_bundle(), ctx)
+    assert not sub.passes
+    assert sub.details["llm_pass"] is False
+    assert "M&A at peak multiples" in sub.details["capital_misallocation_flags"]
+
+
+def test_capital_allocation_no_text_returns_no_data_style_fail() -> None:
+    """Without MD&A or shareholder letter, we can't run the LLM leg."""
+    llm = MagicMock(spec=LlmClient)
+    bundle = _bundle(mda="", letter="")
+    sub = CapitalAllocationEvaluator(llm).evaluate(bundle)
+    assert not sub.passes
+    assert "No 10-K MD&A or shareholder-letter text" in sub.rationale
+    # LLM was never called.
+    llm.call.assert_not_called()
 
 
 def test_insider_evaluator_handles_missing_ticker() -> None:
@@ -242,6 +331,12 @@ def _passing_payload(eval_name: str) -> dict:
             "metrics": ["ROIC"], "aligned_with_shareholders": True,
             "rationale": "ok",
         },
+        "capital_allocation": {
+            "stated_priorities": ["reinvestment", "buybacks"],
+            "discipline_score": 9,
+            "capital_misallocation_flags": [],
+            "rationale": "ok",
+        },
     }[eval_name]
 
 
@@ -260,6 +355,8 @@ def _smart_llm() -> MagicMock:
             "submit_horizon_assessment": _passing_payload("horizon"),
             "submit_clarity_assessment": _passing_payload("clarity"),
             "submit_compensation_assessment": _passing_payload("compensation"),
+            "submit_capital_allocation_assessment":
+                _passing_payload("capital_allocation"),
         }
         return LlmCallResult(
             payload=mapping[name],
@@ -271,10 +368,52 @@ def _smart_llm() -> MagicMock:
     return llm
 
 
+_PASSING_FORM4_XML = """<?xml version="1.0"?>
+<ownershipDocument>
+    <reportingOwner>
+        <reportingOwnerId><rptOwnerName>CEO Test</rptOwnerName></reportingOwnerId>
+        <reportingOwnerRelationship>
+            <isDirector>0</isDirector><isOfficer>1</isOfficer>
+            <isTenPercentOwner>0</isTenPercentOwner>
+            <officerTitle>Chief Executive Officer</officerTitle>
+        </reportingOwnerRelationship>
+    </reportingOwner>
+    <nonDerivativeTransaction>
+        <transactionDate><value>2023-08-01</value></transactionDate>
+        <transactionCoding><transactionCode>P</transactionCode></transactionCoding>
+        <transactionAmounts>
+            <transactionShares><value>1000</value></transactionShares>
+            <transactionPricePerShare><value>200</value></transactionPricePerShare>
+        </transactionAmounts>
+        <postTransactionAmounts>
+            <sharesOwnedFollowingTransaction><value>5000</value></sharesOwnedFollowingTransaction>
+        </postTransactionAmounts>
+    </nonDerivativeTransaction>
+</ownershipDocument>"""
+
+
+def _wire_passing_insider(edgar: MagicMock) -> None:
+    """Set up a mock EDGAR so the InsiderAlignmentEvaluator returns PASS.
+
+    The new alignment rule requires meaningful open-market buying
+    (≥ ``INSIDER_MIN_NET_BUY_USD``); a single $200k buy clears the bar
+    while still being trivially deterministic for tests.
+    """
+    edgar.list_filings.return_value = [
+        {
+            "accessionNumber": "0001-23-000001",
+            "filingDate": "2023-08-02",
+            "form": "4",
+            "primaryDocument": "wf-form4.xml",
+        }
+    ]
+    edgar.fetch_form4_xml.return_value = _PASSING_FORM4_XML
+
+
 def test_management_analyzer_aggregates_and_caches(tmp_path: Path) -> None:
     edgar = MagicMock()
     edgar.get_cik.return_value = 999
-    edgar.list_filings.return_value = []  # insider check passes (no trades)
+    _wire_passing_insider(edgar)
 
     llm = _smart_llm()
     bundler = MagicMock(spec=DocumentBundler)
@@ -291,9 +430,13 @@ def test_management_analyzer_aggregates_and_caches(tmp_path: Path) -> None:
     assert r1.blame.passes and r1.long_short.passes
     assert r1.clarity.passes and r1.compensation.passes
     assert r1.insider.passes
+    assert r1.capital_allocation is not None
+    assert r1.capital_allocation.passes
     assert not r1.cached
     assert r2.cached
-    assert llm.call.call_count == 4  # one per LLM evaluator
+    # one LLM call per LLM evaluator: blame, long_short, clarity,
+    # compensation, capital_allocation. Insider is deterministic.
+    assert llm.call.call_count == 5
 
 
 def test_management_analyzer_per_check_dict_lists_all_five() -> None:
@@ -308,7 +451,8 @@ def test_management_analyzer_per_check_dict_lists_all_five() -> None:
     )
     result = analyzer.evaluate("FAKE", as_of=date(2024, 1, 1))
     assert set(result.per_check.keys()) == {
-        "blame", "long_short", "clarity", "compensation", "insider"
+        "blame", "long_short", "clarity", "compensation", "insider",
+        "capital_allocation",
     }
 
 
@@ -351,7 +495,7 @@ def test_management_one_subcheck_exception_does_not_zero_result(tmp_path: Path) 
     surfaced as ``passes=False`` with the exception in its rationale."""
     edgar = MagicMock()
     edgar.get_cik.return_value = 999
-    edgar.list_filings.return_value = []  # insider check passes
+    _wire_passing_insider(edgar)
     llm = _smart_llm()
     original_side = llm.call.side_effect
 
@@ -403,19 +547,90 @@ def test_bundle_hash_stable_for_same_inputs() -> None:
     assert b1.hash() == b2.hash()
 
 
+def test_document_bundler_prefers_archive_documents(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Validated archive docs should feed Management before live fallbacks."""
+
+    class FakeArchive:
+        name = "fake_archive"
+
+        def get_documents(self, ticker, as_of, *, doc_type=None, limit=20):
+            rows = {
+                "ten_k_mda": ArchivedManagementDocument(
+                    ticker=ticker,
+                    as_of=as_of,
+                    doc_type="ten_k_mda",
+                    text="Archived MD&A " * 400,
+                    source_url="https://sec.gov/mda",
+                    storage_path="FAKE/ten_k_mda/doc.txt",
+                    content_hash="a" * 64,
+                    provider="archive",
+                    fiscal_year=2023,
+                ),
+                "earnings_transcript": ArchivedManagementDocument(
+                    ticker=ticker,
+                    as_of=as_of,
+                    doc_type="earnings_transcript",
+                    text="Archived earnings transcript " * 400,
+                    source_url="https://example.com/transcript",
+                    storage_path="FAKE/earnings_transcript/doc.txt",
+                    content_hash="d" * 64,
+                    provider="archive",
+                    published_date=date(2023, 10, 25),
+                    fiscal_year=2023,
+                    fiscal_quarter=3,
+                ),
+                "proxy_compensation": ArchivedManagementDocument(
+                    ticker=ticker,
+                    as_of=as_of,
+                    doc_type="proxy_compensation",
+                    text="Archived CD&A " * 400,
+                    source_url="https://investor.example/proxy",
+                    storage_path="FAKE/proxy_compensation/doc.txt",
+                    content_hash="b" * 64,
+                    provider="archive",
+                    fiscal_year=2023,
+                ),
+                "shareholder_letter": ArchivedManagementDocument(
+                    ticker=ticker,
+                    as_of=as_of,
+                    doc_type="shareholder_letter",
+                    text="Archived shareholder letter " * 400,
+                    source_url="https://investor.example/letter",
+                    storage_path="FAKE/shareholder_letter/doc.txt",
+                    content_hash="c" * 64,
+                    provider="archive",
+                    fiscal_year=2023,
+                ),
+            }
+            return [rows[doc_type]] if doc_type in rows else []
+
+    edgar = MagicMock()
+    edgar.get_cik.return_value = 999
+    edgar.get_company_facts.return_value = {}
+    edgar.list_filings.return_value = []
+    monkeypatch.setattr(
+        "quantitative_trading.agents.rule_one.management_llm.find_pit_10k",
+        lambda *args, **kwargs: None,
+    )
+
+    bundler = DocumentBundler(
+        edgar,
+        archive_provider=ArchiveBackedManagementProvider(FakeArchive()),
+    )
+    bundle = bundler.build("FAKE", date(2024, 1, 1))
+
+    assert bundle.mda_text.startswith("Archived MD&A")
+    assert bundle.def14a_compensation_text.startswith("Archived CD&A")
+    assert bundle.shareholder_letter_text.startswith("Archived shareholder letter")
+    assert bundle.transcripts[0].source == "archive"
+    assert bundle.source_documents["shareholder_letter"]["source_url"].endswith("/letter")
+
+
 def test_pre_coverage_cache_backfills_coverage_from_bundle(tmp_path: Path) -> None:
     """Cache files written before SourceCoverage existed must be hydrated:
     on cache hit we should rebuild coverage from the freshly-built bundle so
     the dashboard's source_coverage block populates without paying for new
     LLM calls."""
-    import json
-
-    from quantitative_trading.agents.rule_one.management_llm import (
-        PROMPT_VERSION,
-        _cache_key,
-        _encode_subcheck,
-    )
-
     edgar = MagicMock()
     edgar.get_cik.return_value = 999
     edgar.list_filings.return_value = []

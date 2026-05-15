@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -10,8 +11,15 @@ from quantitative_trading.agents.rule_one.sticker_price import (
     DEFAULT_FGR_CAP,
     DEFAULT_FUTURE_PE_CAP,
     DEFAULT_REQUIRED_RETURN,
+    INPUT_DISABLED,
+    INPUT_NOT_AVAILABLE,
+    INPUT_USED,
+    NullAnalystProvider,
+    StickerPriceCalculator,
+    compute_historical_avg_pe,
     compute_payback_years,
     compute_sticker_price,
+    compute_sticker_sensitivity,
 )
 
 
@@ -141,3 +149,244 @@ def test_payback_years_returns_none_for_unattainable_target() -> None:
         eps_today_basis=0.01, growth_rate=0.0, current_price=1_000_000.0,
         max_years=10,
     ) is None
+
+
+# --------------------------------------------------------------------------
+# Historical average P/E
+# --------------------------------------------------------------------------
+
+
+def test_historical_avg_pe_uses_split_adjusted_close() -> None:
+    """Average PE should reflect today's-basis price / today's-basis EPS."""
+    # 5 fiscal years, EPS doubles overall, price triples → PE ratio rises.
+    eps_history = {
+        2020: 1.00, 2021: 1.20, 2022: 1.40, 2023: 1.60, 2024: 2.00,
+    }
+    fy_ends = {fy: date(fy, 12, 31) for fy in eps_history}
+    prices = MagicMock()
+    # Close at each year-end (already in today's basis).
+    prices.get_close_at.side_effect = lambda t, d: {
+        date(2020, 12, 31): 20.0, date(2021, 12, 31): 30.0,
+        date(2022, 12, 31): 35.0, date(2023, 12, 31): 40.0,
+        date(2024, 12, 31): 60.0,
+    }[d]
+    prices.split_factor_since.return_value = 1.0  # already in today's basis
+    avg, records = compute_historical_avg_pe(
+        eps_today_basis_series=eps_history,
+        fiscal_year_ends=fy_ends,
+        ticker="X",
+        price_client=prices,
+    )
+    # PE per year: 20, 25, 25, 25, 30 → mean = 25
+    assert avg == pytest.approx(25.0, abs=0.5)
+    assert len(records) == 5
+    assert records[0]["fiscal_year"] == 2020
+    assert records[-1]["fiscal_year"] == 2024
+
+
+def test_historical_avg_pe_returns_none_below_min_years() -> None:
+    """If only 2 fiscal years can be priced we don't trust an average."""
+    eps_history = {2023: 1.0, 2024: 1.0}
+    fy_ends = {2023: date(2023, 12, 31), 2024: date(2024, 12, 31)}
+    prices = MagicMock()
+    prices.get_close_at.return_value = 10.0
+    prices.split_factor_since.return_value = 1.0
+    avg, records = compute_historical_avg_pe(
+        eps_today_basis_series=eps_history,
+        fiscal_year_ends=fy_ends,
+        ticker="X",
+        price_client=prices,
+        min_years=3,
+    )
+    assert avg is None
+    assert len(records) == 2  # still surfaced as evidence
+
+
+def test_historical_avg_pe_handles_split_factor() -> None:
+    """If yfinance returns the unadjusted Close, split factor pulls it
+    down to today's basis. Ensures we don't double-count splits when
+    EPS is already today's basis."""
+    eps_history = {
+        2018: 1.0, 2019: 1.0, 2020: 1.0, 2021: 1.0, 2022: 1.0,
+    }
+    fy_ends = {fy: date(fy, 12, 31) for fy in eps_history}
+    prices = MagicMock()
+    prices.get_close_at.return_value = 200.0
+    # 4:1 split since 2018, no further splits.
+    prices.split_factor_since.side_effect = lambda t, d: (
+        4.0 if d.year == 2018 else 1.0
+    )
+    avg, records = compute_historical_avg_pe(
+        eps_today_basis_series=eps_history,
+        fiscal_year_ends=fy_ends,
+        ticker="X",
+        price_client=prices,
+    )
+    # 2018 PE: 200/4 / 1 = 50; later years: 200 / 1 = 200.
+    # Average over 5 years: (50 + 200*4)/5 = 850/5 = 170.
+    assert avg == pytest.approx(170.0, abs=0.5)
+
+
+# --------------------------------------------------------------------------
+# Sensitivity sweep
+# --------------------------------------------------------------------------
+
+
+def test_sensitivity_includes_base_and_neighbouring_growth_rates() -> None:
+    """Sweep should always contain the base case (delta=0) and produce
+    monotone stickers along the FGR axis (higher growth → higher sticker)."""
+    out = compute_sticker_sensitivity(
+        eps_today_basis=2.0,
+        historical_growth_rate=0.10,
+        historical_avg_pe=None,
+        required_return=0.15,
+        fgr_cap=0.15,
+        future_pe_cap=30.0,
+        horizon_years=10,
+        current_price=50.0,
+    )
+    fgr_rows = out["future_growth_rate"]
+    assert len(fgr_rows) == 5
+    inputs = [r["input"] for r in fgr_rows]
+    # Base (10%) is in the middle; capped extremes.
+    assert pytest.approx(0.10, abs=1e-6) in inputs
+    # Sticker is monotonically non-decreasing with FGR.
+    stickers = [r["sticker"] for r in fgr_rows]
+    assert stickers == sorted(stickers)
+    # MoS price tracks sticker / 2.
+    for r in fgr_rows:
+        assert r["mos_price"] == pytest.approx(r["sticker"] / 2.0, abs=1e-9)
+
+
+def test_sensitivity_handles_zero_current_price() -> None:
+    """When current price is zero, ``implied_mos_pct`` is None — never crash."""
+    out = compute_sticker_sensitivity(
+        eps_today_basis=2.0,
+        historical_growth_rate=0.10,
+        historical_avg_pe=None,
+        required_return=0.15,
+        fgr_cap=0.15,
+        future_pe_cap=30.0,
+        horizon_years=10,
+        current_price=0.0,
+    )
+    for r in out["future_growth_rate"]:
+        assert r["implied_mos_pct"] is None
+
+
+# --------------------------------------------------------------------------
+# StickerPriceCalculator end-to-end (mocked clients)
+# --------------------------------------------------------------------------
+
+
+def _build_eps_facts(years: list[int], eps_vals: list[float]) -> dict:
+    """SEC-shaped facts payload with EarningsPerShareDiluted only."""
+    entries = []
+    for fy, val in zip(years, eps_vals):
+        entries.append({
+            "end": f"{fy}-12-31", "start": f"{fy}-01-01",
+            "val": val, "accn": f"A{fy}", "fy": fy, "fp": "FY",
+            "form": "10-K", "filed": f"{fy + 1}-02-01",
+        })
+    return {
+        "facts": {"us-gaap": {
+            "EarningsPerShareDiluted": {
+                "label": "EPS Diluted",
+                "units": {"USD/shares": entries},
+            },
+            "Revenues": {
+                "label": "Revenues",
+                "units": {"USD": [
+                    {"end": f"{fy}-12-31", "start": f"{fy}-01-01",
+                     "val": 100.0, "accn": f"A{fy}", "fy": fy, "fp": "FY",
+                     "form": "10-K", "filed": f"{fy + 1}-02-01"}
+                    for fy in years
+                ]},
+            },
+        }, "dei": {}},
+        "cik": 999,
+    }
+
+
+def test_calculator_records_inputs_used_when_no_pe_history() -> None:
+    """Without historical EPS / FY ends the historical-PE input is
+    explicitly recorded as not_available and analyst as disabled (default
+    null provider)."""
+    edgar = MagicMock()
+    edgar.get_cik.return_value = 999
+    edgar.get_company_facts.return_value = _build_eps_facts(
+        list(range(2014, 2024)), [1.0 * 1.10 ** i for i in range(10)],
+    )
+    prices = MagicMock()
+    prices.split_factor_since.return_value = 1.0
+    prices.get_close_at.return_value = 50.0
+    calc = StickerPriceCalculator(edgar, prices)
+    sticker, _ = calc.evaluate(
+        "FAKE", as_of=date(2025, 6, 1), historical_eps_growth=0.10,
+    )
+    assert sticker.inputs_used["historical_growth"] == INPUT_USED
+    assert sticker.inputs_used["historical_avg_pe"] == INPUT_NOT_AVAILABLE
+    assert sticker.inputs_used["analyst_growth"] == INPUT_DISABLED
+
+
+def test_calculator_uses_historical_avg_pe_when_provided() -> None:
+    """When EPS history + FY ends are passed in, the calculator computes
+    a historical avg PE and records ``historical_avg_pe = used``."""
+    edgar = MagicMock()
+    edgar.get_cik.return_value = 999
+    edgar.get_company_facts.return_value = _build_eps_facts(
+        list(range(2019, 2024)), [1.0, 1.10, 1.21, 1.33, 1.46],
+    )
+    prices = MagicMock()
+    prices.split_factor_since.return_value = 1.0
+    prices.get_close_at.return_value = 20.0
+    calc = StickerPriceCalculator(edgar, prices)
+    eps_hist = {fy: v for fy, v in zip(
+        range(2019, 2024), [1.0, 1.10, 1.21, 1.33, 1.46],
+    )}
+    fy_ends = {fy: date(fy, 12, 31) for fy in eps_hist}
+    sticker, _ = calc.evaluate(
+        "FAKE", as_of=date(2025, 6, 1), historical_eps_growth=0.10,
+        eps_history=eps_hist, fiscal_year_ends=fy_ends,
+    )
+    assert sticker.historical_avg_pe is not None
+    assert sticker.inputs_used["historical_avg_pe"] == INPUT_USED
+    assert len(sticker.pe_history) == 5
+    # Sensitivity sweep populated.
+    assert sticker.sensitivity["future_growth_rate"]
+    assert sticker.sensitivity["required_return"]
+
+
+def test_calculator_uses_analyst_provider_when_credentials_available() -> None:
+    """A wired-up provider that returns a lower-than-historical estimate
+    binds the FGR — and the result records ``analyst_growth = used``."""
+
+    class StubProvider:
+        def credentials_available(self) -> bool:
+            return True
+
+        def get_eps_growth_5y(self, ticker: str, as_of: date) -> float | None:  # noqa: ARG002
+            return 0.06  # below historical 10%
+
+    edgar = MagicMock()
+    edgar.get_cik.return_value = 999
+    edgar.get_company_facts.return_value = _build_eps_facts(
+        list(range(2014, 2024)), [1.0 * 1.10 ** i for i in range(10)],
+    )
+    prices = MagicMock()
+    prices.split_factor_since.return_value = 1.0
+    prices.get_close_at.return_value = 50.0
+    calc = StickerPriceCalculator(edgar, prices, analyst_provider=StubProvider())
+    sticker, _ = calc.evaluate(
+        "FAKE", as_of=date(2025, 6, 1), historical_eps_growth=0.10,
+    )
+    assert sticker.analyst_growth_estimate == pytest.approx(0.06, abs=1e-6)
+    assert sticker.inputs_used["analyst_growth"] == INPUT_USED
+    # Future growth was clamped to 6% (analyst), then to 0..15% by fgr_cap → 6%.
+    assert sticker.future_growth_rate == pytest.approx(0.06, abs=1e-6)
+
+
+def test_null_analyst_provider_returns_none_and_disables_input() -> None:
+    p = NullAnalystProvider()
+    assert p.credentials_available() is False
+    assert p.get_eps_growth_5y("X", date(2024, 1, 1)) is None

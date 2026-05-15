@@ -48,7 +48,6 @@ from quantitative_trading.agents.rule_one.management_llm import (
     SubCheck,
 )
 
-
 SCHEMA_VERSION = 1
 
 STATUS_PASS = "pass"
@@ -85,12 +84,48 @@ _BIG_FIVE_LABELS: dict[str, str] = {
     "current_ratio": "Current ratio",
 }
 
+# Per-metric units. ``value_unit`` describes the headline metric value
+# (e.g. ROIC average is a decimal fraction); ``yearly_unit`` describes the
+# underlying per-fiscal-year series (e.g. EPS yearly values are dollars per
+# share, revenue yearly values are dollars). The dashboard uses these to
+# format both columns correctly — the previous single ``unit`` field caused
+# raw EPS/dollar values to be rendered as percentages.
+_BIG_FIVE_VALUE_UNITS: dict[str, str] = {
+    "roic": "fraction",
+    "sales_growth": "fraction",
+    "eps_growth": "fraction",
+    "equity_growth": "fraction",
+    "ocf_growth": "fraction",
+    "current_ratio": "ratio_decimal",
+}
 
-def _metric_status(metric: MetricResult) -> str:
-    """Pass / fail / no_data status from a Big 5 ``MetricResult``."""
+_BIG_FIVE_YEARLY_UNITS: dict[str, str] = {
+    "roic": "fraction",
+    "sales_growth": "currency",
+    "eps_growth": "currency_per_share",
+    "equity_growth": "currency",
+    "ocf_growth": "currency",
+    "current_ratio": "ratio_decimal",
+}
+
+
+def _metric_status(metric: MetricResult, *, has_full_window: bool) -> str:
+    """Pass / fail / partial_data / no_data status from a Big 5 ``MetricResult``.
+
+    ``has_full_window`` is True when the metric had every fiscal year of
+    its target window populated. When the metric value is computed but
+    the window is short (relaxed-window CAGR) or the data came from a
+    fallback source, the dashboard should treat it as ``partial_data``
+    rather than ``fail`` — the underlying signal might or might not
+    cross Phil Town's bar, but we don't have enough evidence to call it.
+    """
     if metric.value is None:
         return STATUS_NO_DATA
-    return STATUS_PASS if metric.passes else STATUS_FAIL
+    if metric.passes:
+        return STATUS_PASS
+    if not has_full_window:
+        return STATUS_PARTIAL_DATA
+    return STATUS_FAIL
 
 
 def _yearly_points(series: dict[int, float | None]) -> list[dict[str, Any]]:
@@ -115,40 +150,74 @@ def _metric_evidence(
         p["fiscal_year"] for p in yearly if p["value"] is None
     ]
     years_used = len(years_with_data)
+    # The current-ratio side check looks only at the latest FY so the
+    # "relaxed window" concept doesn't apply.
+    is_window_metric = key != "current_ratio"
+    has_full_window = (not is_window_metric) or years_used >= n_years_target
     relaxed = (
-        # Big 5 growth/ROIC are configured for a 10y window. If the actual
-        # span between earliest and latest non-null years is less than the
-        # target, the rule was applied on a relaxed window.
-        years_used > 0
-        and years_used < n_years_target
-        and key != "current_ratio"
+        is_window_metric and years_used > 0 and years_used < n_years_target
     )
+    interior_gaps = _interior_gaps(years_with_data, missing)
 
+    value_unit = _BIG_FIVE_VALUE_UNITS.get(key, "fraction")
+    yearly_unit = _BIG_FIVE_YEARLY_UNITS.get(key, value_unit)
     out: dict[str, Any] = {
         "label": _BIG_FIVE_LABELS.get(key, metric.name or key),
-        "status": _metric_status(metric),
+        "status": _metric_status(metric, has_full_window=has_full_window),
         "value": (None if metric.value is None else float(metric.value)),
         "threshold": float(metric.threshold),
         "passes": bool(metric.passes),
+        "decision_grade": bool(getattr(metric, "decision_grade", metric.passes)),
+        "data_source": getattr(metric, "data_source", "sec_xbrl"),
         "rationale": metric.rationale,
         "calculation_method": _BIG_FIVE_METHODS.get(key, "unknown"),
-        "unit": "ratio_decimal" if key == "current_ratio" else "fraction",
+        # ``unit`` is preserved for backwards compatibility with older
+        # dashboard builds; new code should prefer ``value_unit`` and
+        # ``yearly_unit`` so headline ratios and per-year underlyings can
+        # be formatted differently (e.g. ROIC% headline + raw EPS yearly).
+        "unit": value_unit,
+        "value_unit": value_unit,
+        "yearly_unit": yearly_unit,
         "yearly": yearly,
         "years_used": years_used,
         "years_with_data": years_with_data,
         "missing_fiscal_years": missing,
+        "interior_gaps": interior_gaps,
         "n_years_target": n_years_target,
         "relaxed_window": relaxed,
     }
     if relaxed:
         out["relaxed_reason"] = (
-            f"Only {years_used} of the target {n_years_target} fiscal years "
-            "have usable XBRL data. Phil Town's strict rule wants a full "
-            "10-year history; the screen falls back to the longest "
-            "available span (minimum 5 years) so newer or less-reported "
-            "issuers can still be evaluated."
+            f"Only {years_used} of the target {n_years_target} fiscal "
+            "years have usable XBRL data. Phil Town's rule explicitly "
+            "wants a full 10-year window; we still surface the CAGR / "
+            "ROIC computed over the available history, but the gate "
+            "stays open (PARTIAL DATA) until the missing years catch up."
+        )
+    elif interior_gaps:
+        out["relaxed_reason"] = (
+            f"Window has interior gaps ({', '.join(map(str, interior_gaps))}) "
+            "— treat the headline value as approximate."
         )
     return out
+
+
+def _interior_gaps(
+    years_with_data: list[int],
+    missing_years: list[int],
+) -> list[int]:
+    """Return the missing years that fall *inside* the populated window.
+
+    A gap at the start of the window (typical for young issuers / late
+    XBRL adoption) is not an "interior" gap — it just means the company
+    hasn't been around for the full 10y. An interior gap, by contrast,
+    suggests a tagging issue or a restatement that dropped a single
+    year, and the dashboard should warn the user separately.
+    """
+    if not years_with_data or not missing_years:
+        return []
+    earliest_present = min(years_with_data)
+    return sorted(fy for fy in missing_years if fy > earliest_present)
 
 
 def build_big_five_evidence(big_five: BigFiveResult | None) -> dict[str, Any]:
@@ -233,6 +302,14 @@ _SUBCHECK_SPECS: dict[str, dict[str, Any]] = {
         "required_sources": ["form4"],
         "any_of_required": False,
     },
+    "capital_allocation": {
+        "label": "Capital allocation",
+        # The check needs at least one qualitative source (MD&A or
+        # shareholder letter) to evaluate the LLM side; ``any_of`` keeps
+        # the gate workable when one source is missing.
+        "required_sources": ["mda", "shareholder_letter"],
+        "any_of_required": True,
+    },
 }
 
 
@@ -275,9 +352,8 @@ def _derive_subcheck_status(
             return STATUS_NO_DATA, missing
         if missing:
             return STATUS_PARTIAL_DATA, missing
-    else:
-        if missing:
-            return STATUS_NO_DATA, missing
+    elif missing:
+        return STATUS_NO_DATA, missing
 
     return (STATUS_PASS if sub.passes else STATUS_FAIL), missing
 
@@ -326,6 +402,7 @@ def _coverage_to_dict(coverage: SourceCoverage | None) -> dict[str, Any] | None:
             "available": coverage.form4_available,
             "n_transactions": coverage.form4_n_transactions,
         },
+        "source_documents": coverage.source_documents,
     }
 
 
@@ -367,6 +444,33 @@ def build_management_evidence(
 
     coverage_dict = _coverage_to_dict(management.coverage)
 
+    subchecks: dict[str, Any] = {
+        "blame": _subcheck_evidence(
+            key="blame", sub=management.blame, coverage=coverage_dict,
+        ),
+        "long_short": _subcheck_evidence(
+            key="long_short", sub=management.long_short, coverage=coverage_dict,
+        ),
+        "clarity": _subcheck_evidence(
+            key="clarity", sub=management.clarity, coverage=coverage_dict,
+        ),
+        "compensation": _subcheck_evidence(
+            key="compensation", sub=management.compensation, coverage=coverage_dict,
+        ),
+        "insider": _subcheck_evidence(
+            key="insider", sub=management.insider, coverage=coverage_dict,
+        ),
+    }
+    # Capital allocation is optional on legacy cache entries (entries
+    # written before the sub-check existed); skip the slot rather than
+    # emit a confusing "no_data" placeholder when no SubCheck is present.
+    if management.capital_allocation is not None:
+        subchecks["capital_allocation"] = _subcheck_evidence(
+            key="capital_allocation",
+            sub=management.capital_allocation,
+            coverage=coverage_dict,
+        )
+
     return {
         "schema_version": SCHEMA_VERSION,
         "as_of": management.as_of.isoformat() if management.as_of else None,
@@ -375,23 +479,7 @@ def build_management_evidence(
         "cached": bool(management.cached),
         "bundle_hash": management.bundle_hash,
         "source_coverage": coverage_dict,
-        "subchecks": {
-            "blame": _subcheck_evidence(
-                key="blame", sub=management.blame, coverage=coverage_dict,
-            ),
-            "long_short": _subcheck_evidence(
-                key="long_short", sub=management.long_short, coverage=coverage_dict,
-            ),
-            "clarity": _subcheck_evidence(
-                key="clarity", sub=management.clarity, coverage=coverage_dict,
-            ),
-            "compensation": _subcheck_evidence(
-                key="compensation", sub=management.compensation, coverage=coverage_dict,
-            ),
-            "insider": _subcheck_evidence(
-                key="insider", sub=management.insider, coverage=coverage_dict,
-            ),
-        },
+        "subchecks": subchecks,
     }
 
 

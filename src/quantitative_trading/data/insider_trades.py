@@ -280,6 +280,16 @@ def fetch_insider_history(
     return out
 
 
+# Minimum positive open-market buying we require to call the alignment
+# check a clean PASS. Below this threshold "$0 net" looks like a pass on
+# paper but Phil Town's "skin in the game" criterion isn't satisfied —
+# absence of selling is not a positive signal. The threshold is set in
+# notional dollar terms because that's how Phil Town frames it ("are
+# insiders putting their own money in?"); $25k filters out token grants
+# net of taxes while still accepting genuine personal purchases.
+INSIDER_MIN_NET_BUY_USD: float = 25_000.0
+
+
 def summarize_insider_alignment(
     transactions: list[InsiderTransaction],
     *,
@@ -289,17 +299,29 @@ def summarize_insider_alignment(
     coordinated_buy_min_distinct_insiders: int = 3,
     large_recent_sell_threshold_usd: float = 1_000_000.0,
     large_recent_sell_window_days: int = 90,
+    min_net_buy_usd: float = INSIDER_MIN_NET_BUY_USD,
 ) -> InsiderAlignmentResult:
     """Aggregate Form 4 transactions into a Phil-Town-style alignment signal.
 
-    The pass criterion follows the plan:
-        * net open-market buys (excluding plan sells, tax withholding, gifts,
-          grants, derivative exercises) is non-negative, AND
-        * no large coordinated insider sells in the past 90 days (more than
-          ``large_recent_sell_threshold_usd`` of non-plan sells).
+    Pass criteria (all must hold):
 
-    A ``coordinated_buy`` flag is also returned: 3+ distinct insiders making
-    open-market buys within a 60-day window — Phil Town's "massive green flag".
+        * net open-market buying (excluding plan sells, tax withholding,
+          gifts, grants, derivative exercises) is **strictly positive**
+          and at least ``min_net_buy_usd`` in notional terms, AND
+        * no large coordinated insider sells in the past 90 days (more
+          than ``large_recent_sell_threshold_usd`` of non-plan sells).
+
+    The strict ``net >= min_net_buy_usd`` requirement closes the
+    previous "no insider activity → $0 net → PASS" loophole: Phil Town
+    treats *meaningful insider buying* as a positive signal, not the
+    mere absence of selling. When no qualifying activity is observed in
+    the lookback window the check now fails with rationale "no
+    qualifying open-market buys" — and the management evidence layer
+    surfaces that as a real signal failure rather than a clean pass.
+
+    A ``coordinated_buy`` flag is also returned: 3+ distinct insiders
+    making open-market buys within a 60-day window — Phil Town's
+    "massive green flag".
     """
     lookback_start = as_of - timedelta(days=lookback_months * 30)
     in_window = [
@@ -350,15 +372,24 @@ def summarize_insider_alignment(
     )
     has_large_recent = recent_sells > large_recent_sell_threshold_usd
 
-    passes = net >= 0.0 and not has_large_recent
-    rationale = (
-        f"Window {lookback_start.isoformat()}..{as_of.isoformat()}: "
-        f"buys ${buy_value/1e3:,.0f}k, sells ${sell_value/1e3:,.0f}k "
-        f"(non-plan), net ${net/1e3:,.0f}k. "
-        f"Coordinated-buy={coordinated_buy} ({coordinated_count} insiders); "
-        f"large recent sells (last {large_recent_sell_window_days}d)="
-        f"{has_large_recent} (${recent_sells/1e3:,.0f}k)."
-    )
+    passes = net >= min_net_buy_usd and not has_large_recent
+    if not in_window:
+        rationale = (
+            f"No Form 4 transactions in window "
+            f"{lookback_start.isoformat()}..{as_of.isoformat()}; "
+            "absence of selling is not a positive signal — "
+            "alignment check fails for lack of qualifying insider buying."
+        )
+    else:
+        rationale = (
+            f"Window {lookback_start.isoformat()}..{as_of.isoformat()}: "
+            f"buys ${buy_value/1e3:,.0f}k, sells ${sell_value/1e3:,.0f}k "
+            f"(non-plan), net ${net/1e3:,.0f}k "
+            f"(threshold ≥ ${min_net_buy_usd/1e3:,.0f}k). "
+            f"Coordinated-buy={coordinated_buy} ({coordinated_count} insiders); "
+            f"large recent sells (last {large_recent_sell_window_days}d)="
+            f"{has_large_recent} (${recent_sells/1e3:,.0f}k)."
+        )
 
     return InsiderAlignmentResult(
         lookback_start=lookback_start,

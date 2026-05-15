@@ -107,16 +107,24 @@ class TestBigFiveEvidence:
             assert check["missing_fiscal_years"] == []
             assert "relaxed_reason" not in check
 
-    def test_relaxed_window_flagged_with_explanation(self) -> None:
+    def test_relaxed_window_marks_partial_data(self) -> None:
+        """A relaxed-window metric is no longer a clean PASS — even when
+        the underlying CAGR is well above the threshold the dashboard
+        should show PARTIAL DATA so the user knows the gate is open
+        because evidence is missing, not because the company is failing.
+        """
         partial = _partial_series(present_years=6)
-        big_five = _make_big_five(sales_series=partial)
+        big_five = _make_big_five(sales_series=partial, sales_passes=False)
         ev = build_big_five_evidence(big_five)
         sales = ev["checks"]["sales_growth"]
-        assert sales["status"] == STATUS_PASS
+        assert sales["status"] == STATUS_PARTIAL_DATA
         assert sales["relaxed_window"] is True
         assert sales["years_used"] == 6
         assert len(sales["missing_fiscal_years"]) == 4
-        assert "5 years" in sales["relaxed_reason"]
+        assert "Phil Town" in sales["relaxed_reason"]
+        assert "10-year" in sales["relaxed_reason"]
+        # Decision-grade is False whenever the window is not full.
+        assert sales["decision_grade"] is False
 
     def test_no_data_status_when_metric_value_is_none(self) -> None:
         big_five = _make_big_five(roic_value=None)
