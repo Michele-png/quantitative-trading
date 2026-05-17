@@ -39,6 +39,23 @@ class EdgarError(RuntimeError):
     """Raised when EDGAR returns an error or unexpected payload."""
 
 
+def _normalize_ticker_for_sec(ticker: str) -> str:
+    """Return ``ticker`` in the form SEC uses in ``company_tickers.json``.
+
+    Class-share tickers are written with a hyphen by SEC (``BRK-B``, ``BRK-A``,
+    ``BF-B``) while most market data providers (Yahoo Finance, Google Finance,
+    FMP, Alpaca) use a dot (``BRK.B``). The canonical representation throughout
+    this codebase — and the dashboard, Supabase rows, and ``tickers.yml`` —
+    is the dot form, so normalization is applied only at the SEC boundary and
+    not propagated back to callers.
+
+    The transformation is intentionally trivial (``.`` → ``-``) and idempotent:
+    tickers already in SEC form (``BRK-B``) or with no class share (``AAPL``)
+    are unchanged.
+    """
+    return ticker.upper().strip().replace(".", "-")
+
+
 class _RateLimiter:
     """Simple token-bucket rate limiter, thread-safe.
 
@@ -152,9 +169,16 @@ class EdgarClient:
         return list(data.values())
 
     def get_cik(self, ticker: str) -> int:
-        """Look up CIK for a ticker. Raises EdgarError if not found."""
+        """Look up CIK for a ticker. Raises EdgarError if not found.
+
+        Accepts either the dot form used by most market-data providers
+        (``BRK.B``) or the dash form SEC uses internally (``BRK-B``).
+        Normalization happens only on the lookup key — the caller's ticker
+        representation is unchanged.
+        """
         mapping = self.get_company_tickers()
-        cik = mapping.get(ticker.upper())
+        sec_key = _normalize_ticker_for_sec(ticker)
+        cik = mapping.get(sec_key)
         if cik is None:
             raise EdgarError(f"Ticker {ticker!r} not found in SEC company_tickers index.")
         return cik
