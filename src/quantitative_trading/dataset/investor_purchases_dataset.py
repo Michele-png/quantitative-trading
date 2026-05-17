@@ -406,19 +406,32 @@ def enrich_with_realized_returns(
     cagrs: list[float | None] = []
     censored: list[bool | None] = []
 
-    for _, row in df.iterrows():
-        inv_qty = investor_quarterly_cusips.get(row["investor_short_id"], {})
+    # Extract only the columns the loop reads, once. ``iterrows`` builds a
+    # full pandas Series per row which dominates wall time here; the
+    # downstream work (sorted/walk/CAGR) is inherently scalar.
+    investor_ids = df["investor_short_id"].tolist()
+    cusip_col = df["cusip"].tolist()
+    period_col = df["period_of_report"].tolist()
+    ticker_col = df["ticker"].tolist() if "ticker" in df.columns else [None] * len(df)
+    t_eval_col = df["t_eval"].tolist()
+
+    for investor_id, cusip_val, period_val, ticker_val, t_eval_val in zip(
+        investor_ids, cusip_col, period_col, ticker_col, t_eval_col, strict=True,
+    ):
+        inv_qty = investor_quarterly_cusips.get(investor_id, {})
         sorted_q = sorted(inv_qty.keys())
-        appearance_q = row["period_of_report"]
-        if isinstance(appearance_q, str):
-            appearance_q = date.fromisoformat(appearance_q)
+        appearance_q = (
+            date.fromisoformat(period_val)
+            if isinstance(period_val, str)
+            else period_val
+        )
 
         # Walk forward from appearance_q.
         exit_q: date | None = None
         for q in sorted_q:
             if q <= appearance_q:
                 continue
-            if row["cusip"] not in inv_qty[q]:
+            if cusip_val not in inv_qty[q]:
                 exit_q = q
                 break
 
@@ -433,16 +446,19 @@ def enrich_with_realized_returns(
         holding_q = max(0, delta_months // 3)
 
         # Realized CAGR (only if ticker is known).
-        ticker = row.get("ticker")
         cagr: float | None = None
-        if ticker and not pd.isna(ticker):
-            t_eval = row["t_eval"]
-            if isinstance(t_eval, str):
-                t_eval = date.fromisoformat(t_eval)
+        if ticker_val and not pd.isna(ticker_val):
+            t_eval = (
+                date.fromisoformat(t_eval_val)
+                if isinstance(t_eval_val, str)
+                else t_eval_val
+            )
             try:
-                cagr = prices.forward_total_return_cagr(ticker, t_eval, end_for_return)
+                cagr = prices.forward_total_return_cagr(
+                    ticker_val, t_eval, end_for_return,
+                )
             except Exception as exc:  # noqa: BLE001
-                log.debug("CAGR failed for %s: %s", ticker, exc)
+                log.debug("CAGR failed for %s: %s", ticker_val, exc)
                 cagr = None
 
         holdings.append(holding_q)

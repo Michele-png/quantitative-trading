@@ -191,10 +191,17 @@ class QuantExtrasAnalyzer:
         *,
         big_five: BigFiveResult | None = None,
         n_years: int = 10,
+        pit_facts: PointInTimeFacts | None = None,
     ) -> QuantExtrasResult:
-        cik = self._edgar.get_cik(ticker)
-        facts = self._edgar.get_company_facts(cik)
-        pit = PointInTimeFacts(facts)
+        # See ``BigFiveAnalyzer.evaluate``: the shared ``pit_facts`` is
+        # threaded down from the agent so a single (ticker, as_of) only
+        # parses the SEC companyfacts JSON once across all analyzers.
+        if pit_facts is not None:
+            pit = pit_facts
+        else:
+            cik = self._edgar.get_cik(ticker)
+            facts = self._edgar.get_company_facts(cik)
+            pit = PointInTimeFacts(facts)
 
         latest_fy = pit.latest_fiscal_year_with_data("revenue", as_of)
         if latest_fy is None:

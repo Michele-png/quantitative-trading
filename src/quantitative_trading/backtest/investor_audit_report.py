@@ -492,7 +492,10 @@ def format_headline_table(df: pd.DataFrame) -> str:
         f"{'criterion':>22s}  {'elite':>10s}  {'ctrl':>10s}  {'premium':>9s}  "
         f"{'cmh_p':>9s}  {'bh_q':>9s}  method",
     ]
-    for _, r in df.iterrows():
+    # ``itertuples(index=False)`` is several times faster than ``iterrows``
+    # for this kind of all-columns-needed access pattern; full vectorisation
+    # is awkward because each row produces a uniquely formatted text line.
+    for r in df.itertuples(index=False):
         elite = f"{int(r.elite_pass)}/{int(r.elite_n)} ({r.elite_rate*100:4.1f}%)"
         ctrl = f"{int(r.control_pass)}/{int(r.control_n)} ({r.control_rate*100:4.1f}%)"
         flag = "***" if r.bh_q < 0.05 else ("*" if r.bh_q < 0.10 else "")

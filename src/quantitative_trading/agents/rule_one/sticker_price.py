@@ -371,6 +371,21 @@ class StickerPriceCalculator:
         self._prices = price_client
         self._analyst = analyst_provider or NullAnalystProvider()
 
+    def _resolve_pit(
+        self, ticker: str, pit_facts: PointInTimeFacts | None,
+    ) -> PointInTimeFacts:
+        """Return the supplied PIT facts or build a fresh one for ``ticker``.
+
+        Extracted to its own method so ``evaluate`` stays under ruff's
+        branch-count cap; reusing a caller-supplied ``PointInTimeFacts``
+        is also the hot path when the agent threads one through.
+        """
+        if pit_facts is not None:
+            return pit_facts
+        cik = self._edgar.get_cik(ticker)
+        facts = self._edgar.get_company_facts(cik)
+        return PointInTimeFacts(facts)
+
     def evaluate(
         self,
         ticker: str,
@@ -384,6 +399,7 @@ class StickerPriceCalculator:
         payback_threshold: float = DEFAULT_PAYBACK_THRESHOLD,
         eps_history: dict[int, float | None] | None = None,
         fiscal_year_ends: dict[int, date | None] | None = None,
+        pit_facts: PointInTimeFacts | None = None,
     ) -> tuple[StickerPriceResult, PaybackTimeResult]:
         """Compute Sticker Price + MoS + Payback Time at ``as_of``.
 
@@ -403,10 +419,12 @@ class StickerPriceCalculator:
         ``StickerPriceResult.inputs_used`` so the dashboard can show
         "analyst growth = not available" instead of silently dropping
         the input.
+
+        ``pit_facts`` is an optional shared ``PointInTimeFacts`` instance.
+        When provided, the calculator reuses it instead of re-fetching
+        company facts — see ``RuleOneAgent.evaluate`` for the orchestration.
         """
-        cik = self._edgar.get_cik(ticker)
-        facts = self._edgar.get_company_facts(cik)
-        pit = PointInTimeFacts(facts)
+        pit = self._resolve_pit(ticker, pit_facts)
 
         latest_fy = pit.latest_fiscal_year_with_data("eps_diluted", as_of)
         if latest_fy is None:

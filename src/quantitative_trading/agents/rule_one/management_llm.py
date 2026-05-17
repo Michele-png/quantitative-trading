@@ -416,11 +416,23 @@ class DocumentBundler:
         )
         self._transcript_quarters = transcript_quarters
 
-    def build(self, ticker: str, as_of: date) -> DocumentBundle:  # noqa: PLR0912, PLR0915
+    def build(  # noqa: PLR0912, PLR0915
+        self,
+        ticker: str,
+        as_of: date,
+        *,
+        pit_facts: PointInTimeFacts | None = None,
+    ) -> DocumentBundle:
         ticker = ticker.upper()
         cik = self._edgar.get_cik(ticker)
-        facts = self._edgar.get_company_facts(cik)
-        pit = PointInTimeFacts(facts)
+        # Reuse the agent-level ``PointInTimeFacts`` when supplied so the
+        # management bundler doesn't re-parse the same companyfacts JSON
+        # the Big 5 / sticker analyzers just consumed.
+        if pit_facts is not None:
+            pit = pit_facts
+        else:
+            facts = self._edgar.get_company_facts(cik)
+            pit = PointInTimeFacts(facts)
         source_documents: dict[str, Any] = {}
 
         mda_text = ""
@@ -1545,8 +1557,9 @@ class ManagementAnalyzer:
         as_of: date,
         *,
         capital_allocation_context: CapitalAllocationContext | None = None,
+        pit_facts: PointInTimeFacts | None = None,
     ) -> ManagementResult:
-        bundle = self._bundler.build(ticker, as_of)
+        bundle = self._bundler.build(ticker, as_of, pit_facts=pit_facts)
         bundle_hash = bundle.hash()
         # ``DocumentBundler`` stores its transcript-quarter target on
         # ``_transcript_quarters``; fall back to the module default so the

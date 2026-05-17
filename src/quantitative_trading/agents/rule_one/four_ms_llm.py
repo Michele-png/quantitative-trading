@@ -435,10 +435,16 @@ class FourMsAnalyzer:
         *,
         ticker_masked: bool = False,
         max_input_chars: int = MAX_INPUT_CHARS,
+        pit_facts: PointInTimeFacts | None = None,
     ) -> FourMsResult:
         cik = self._edgar.get_cik(ticker)
-        facts = self._edgar.get_company_facts(cik)
-        pit = PointInTimeFacts(facts)
+        # Reuse a shared ``PointInTimeFacts`` when the agent supplies one so
+        # we don't re-parse the same companyfacts JSON for every analyzer.
+        if pit_facts is not None:
+            pit = pit_facts
+        else:
+            facts = self._edgar.get_company_facts(cik)
+            pit = PointInTimeFacts(facts)
 
         filing = find_pit_10k(pit, self._edgar, cik, as_of)
         if filing is None:

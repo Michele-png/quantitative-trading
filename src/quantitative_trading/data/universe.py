@@ -96,10 +96,17 @@ class SP500Universe:
         """
         df = self._load()
         rows = df[df["ticker"] == ticker.upper().strip()]
+        # Pull the two columns out as numpy arrays once and zip them, instead
+        # of paying ``DataFrame.iterrows``' Series-per-row overhead for what
+        # is just a 2-column projection.
+        start_dates = rows["start_date"].to_numpy()
+        end_dates = rows["end_date"].to_numpy()
         out: list[tuple[date, date | None]] = []
-        for _, r in rows.iterrows():
-            start = r["start_date"].date()
-            end = r["end_date"].date() if pd.notna(r["end_date"]) else None
+        for start_val, end_val in zip(start_dates, end_dates, strict=True):
+            start = pd.Timestamp(start_val).date()
+            end = (
+                pd.Timestamp(end_val).date() if pd.notna(end_val) else None
+            )
             out.append((start, end))
         return out
 

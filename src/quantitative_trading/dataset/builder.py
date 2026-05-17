@@ -14,12 +14,14 @@ a single `dataset_dir/dataset.parquet`.
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import pyarrow.dataset as pa_dataset
+import pyarrow.parquet as pq
 from anthropic import Anthropic
 from tqdm import tqdm
 
@@ -37,6 +39,12 @@ from quantitative_trading.dataset.labels import (
 
 
 log = logging.getLogger(__name__)
+
+
+# Cap on concurrent ``agent.evaluate`` calls per chunk. Each evaluate may make
+# one LLM 4Ms request (the cache absorbs repeats keyed by ``(ticker,
+# fiscal_year)``), so this also caps simultaneous Anthropic requests at 8.
+MAX_AGENT_WORKERS = 8
 
 
 # ---------------------------------------------------------------- Trade dates
@@ -255,23 +263,30 @@ def build_dataset(
             members = members[:sample_size]
         log.info("Processing %s — %d tickers", trade_date, len(members))
 
-        rows: list[dict[str, Any]] = []
-        for ticker in tqdm(members, desc=str(trade_date), leave=False):
-            try:
-                result = agent.evaluate(
-                    ticker, trade_date, include_llm=include_llm
-                )
-                label = compute_label(
-                    ticker, trade_date, prices,
-                    label_horizon_years=label_horizon_years,
-                    target_cagr=target_cagr,
-                )
-                rows.append(_row_from_result(result, label))
-            except Exception as exc:  # noqa: BLE001
-                log.warning("Agent failed for %s @ %s: %s", ticker, trade_date, exc)
-                rows.append(_error_row(ticker, trade_date, str(exc)))
+        # Single-threaded warm-up of the per-ticker SEC companyfacts cache.
+        # The agent's parallel ``evaluate`` workers below all read the same
+        # on-disk JSON; warming it sequentially first avoids two threads
+        # racing to fetch + write the same file.
+        _prewarm_company_facts(edgar, members)
 
-        df = pd.DataFrame(rows)
+        rows = _evaluate_chunk_parallel(
+            agent=agent,
+            prices=prices,
+            members=members,
+            trade_date=trade_date,
+            include_llm=include_llm,
+            label_horizon_years=label_horizon_years,
+            target_cagr=target_cagr,
+        )
+
+        # Deterministic row order — sort by (ticker, trade_date). trade_date
+        # is constant within a chunk but we still include it so the same
+        # ordering convention applies when the consolidated parquet is
+        # produced. ``stable`` keeps multiple rows for the same key in their
+        # original collection order.
+        df = pd.DataFrame(rows).sort_values(
+            ["ticker", "trade_date"], kind="stable",
+        ).reset_index(drop=True)
         df.to_parquet(chunk_path, index=False)
         log.info(
             "Saved chunk %s — %d rows, %d full-buys",
@@ -282,16 +297,129 @@ def build_dataset(
     return consolidate(output_dir)
 
 
+def _prewarm_company_facts(edgar: EdgarClient, tickers: list[str]) -> None:
+    """Sequentially prefetch SEC companyfacts for every ticker in the chunk.
+
+    The disk cache is then warm for all parallel workers, so the
+    ``ThreadPoolExecutor`` never has two threads racing to write the same
+    JSON file. Failures are logged at ``debug`` because the per-evaluate
+    fallback inside ``agent.evaluate`` will report them at the right log
+    level if they actually matter for that ticker.
+    """
+    for ticker in tickers:
+        try:
+            cik = edgar.get_cik(ticker)
+            edgar.get_company_facts(cik)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("companyfacts prewarm failed for %s: %s", ticker, exc)
+
+
+def _evaluate_one(
+    *,
+    agent: RuleOneAgent,
+    prices: PriceClient,
+    ticker: str,
+    trade_date: date,
+    include_llm: bool,
+    label_horizon_years: int,
+    target_cagr: float,
+) -> dict[str, Any]:
+    """Run the agent + label for one (ticker, trade_date) pair."""
+    try:
+        result = agent.evaluate(
+            ticker, trade_date, include_llm=include_llm,
+        )
+        label = compute_label(
+            ticker, trade_date, prices,
+            label_horizon_years=label_horizon_years,
+            target_cagr=target_cagr,
+        )
+        return _row_from_result(result, label)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Agent failed for %s @ %s: %s", ticker, trade_date, exc)
+        return _error_row(ticker, trade_date, str(exc))
+
+
+def _evaluate_chunk_parallel(
+    *,
+    agent: RuleOneAgent,
+    prices: PriceClient,
+    members: list[str],
+    trade_date: date,
+    include_llm: bool,
+    label_horizon_years: int,
+    target_cagr: float,
+) -> list[dict[str, Any]]:
+    """Run ``agent.evaluate`` for every ticker in ``members`` with a bounded
+    ``ThreadPoolExecutor``. ``agent.evaluate`` is sync, and the LLM 4Ms client
+    is I/O-bound, so a thread pool is the natural fit — no asyncio rewrite
+    needed. The pool is capped at ``MAX_AGENT_WORKERS`` (8) per the audit.
+    """
+    rows: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=MAX_AGENT_WORKERS) as ex:
+        futures = {
+            ex.submit(
+                _evaluate_one,
+                agent=agent,
+                prices=prices,
+                ticker=ticker,
+                trade_date=trade_date,
+                include_llm=include_llm,
+                label_horizon_years=label_horizon_years,
+                target_cagr=target_cagr,
+            ): ticker
+            for ticker in members
+        }
+        for fut in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc=str(trade_date),
+            leave=False,
+        ):
+            rows.append(fut.result())
+    return rows
+
+
 def consolidate(output_dir: Path | None = None) -> Path:
-    """Merge all chunk parquets into a single dataset.parquet."""
+    """Merge all chunk parquets into a single dataset.parquet.
+
+    Reads the chunk directory as a ``pyarrow.dataset`` so we stream the
+    files in a single Arrow scan instead of materialising one DataFrame
+    per chunk and ``pd.concat``-ing them at the end — the latter
+    duplicates memory and was the dominant cost on full-sized
+    consolidations. The final pandas-side reorder preserves the column
+    order from the first chunk so downstream consumers see the same
+    schema as before.
+    """
     cfg = get_config()
     output_dir = output_dir or cfg.dataset_dir
     chunks_dir = output_dir / "chunks"
     chunk_files = sorted(chunks_dir.glob("chunk_*.parquet"))
     if not chunk_files:
         raise FileNotFoundError(f"No chunks found in {chunks_dir}")
-    frames = [pd.read_parquet(p) for p in chunk_files]
-    df = pd.concat(frames, ignore_index=True)
+
+    # Preserve the original chunk-0 column order — pyarrow may union the
+    # schemas in a different order if individual chunks were written with
+    # slightly different column sequences (older chunks predate newer
+    # columns). We re-project to chunk_0_cols to keep downstream consumers
+    # (notebooks, the backtest) seeing the historical layout.
+    first_table = pq.read_table(chunk_files[0])
+    chunk_0_cols: list[str] = list(first_table.column_names)
+
+    ds = pa_dataset.dataset(
+        [str(p) for p in chunk_files], format="parquet",
+    )
+    table = ds.to_table()
+    union_cols = list(table.column_names)
+    # Re-project: keep chunk_0 ordering for the columns we know, append any
+    # extras at the end. ``pa.Table.select`` is a zero-copy column slice.
+    ordered_cols = chunk_0_cols + [c for c in union_cols if c not in chunk_0_cols]
+    if ordered_cols != union_cols:
+        table = table.select(ordered_cols)
+    df = table.to_pandas()
+    # Ensure even pandas-side column ordering matches the chunk-0 source.
+    if list(df.columns) != ordered_cols:
+        df = df[ordered_cols]
     out = output_dir / "dataset.parquet"
     df.to_parquet(out, index=False)
     log.info("Consolidated dataset: %s rows, %s columns -> %s",

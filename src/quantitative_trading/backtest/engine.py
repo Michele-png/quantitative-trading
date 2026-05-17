@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from anthropic import Anthropic  # noqa: F401  (kept for symmetry with builder)
 
@@ -75,12 +75,31 @@ def add_random_qual_decision(
         base_meaning, base_moat, base_management,
     )
 
-    decisions = []
-    for _, row in out.iterrows():
-        if not bool(row.get("decision_quant_pass", False)):
+    # Extract the columns we touch into plain Python lists once. Iterating
+    # by column avoids the ~10x per-row overhead ``DataFrame.iterrows``
+    # adds on top of materialising a Series per row, while keeping the
+    # hash-based decision logic byte-for-byte identical to the previous
+    # implementation. We don't fully vectorise the hash because SHA-256 is
+    # inherently scalar per (ticker, trade_date, M) key.
+    tickers = out["ticker"].tolist()
+    if "decision_quant_pass" in out.columns:
+        quant_pass = out["decision_quant_pass"].astype(bool).tolist()
+    else:
+        quant_pass = [False] * len(out)
+    trade_dates_raw = out["trade_date"].tolist()
+    trade_dates: list[str] = [
+        td.isoformat() if hasattr(td, "isoformat") else str(td)
+        for td in trade_dates_raw
+    ]
+
+    decisions: list[bool] = []
+    for ticker, td_iso, passes_quant in zip(
+        tickers, trade_dates, quant_pass, strict=True,
+    ):
+        if not passes_quant:
             decisions.append(False)
             continue
-        key_base = f"{row['ticker']}|{row['trade_date'].isoformat() if hasattr(row['trade_date'], 'isoformat') else row['trade_date']}"
+        key_base = f"{ticker}|{td_iso}"
         passes_all = True
         for m, rate in (
             ("meaning", base_meaning),
@@ -107,20 +126,79 @@ def add_spy_forward_cagr(
 ) -> pd.DataFrame:
     """Add a `spy_forward_cagr` column (per-row SPY CAGR over the same horizon).
 
-    Cached SPY history is fetched once via PriceClient.
+    Implementation notes
+    --------------------
+    The previous implementation called
+    ``PriceClient.forward_total_return_cagr`` once per row, which re-scanned
+    the full SPY series for every trade date. We now fetch SPY's adjusted-
+    close series once and vectorise the lookup:
+
+        idx_start = searchsorted_right(spy_dates, trade_date) - 1
+        idx_end   = searchsorted_right(spy_dates, trade_date + horizon) - 1
+
+    Both indices give "the last trading day at or before the target date" —
+    exactly what ``df.loc[df.index <= ts].iloc[-1]`` returns in the scalar
+    version, so the resulting CAGR is numerically identical for valid rows.
+
+    The CAGR formula is::
+
+        cagr = (p1 / p0) ** (1 / years) - 1
+
+    where ``years = horizon_days / 365.25`` is a constant across rows
+    (because each row uses the same horizon), matching the per-row formula
+    exactly.
     """
     out = df.copy()
     pc = PriceClient()
-    pc.get_history(spy_ticker)  # warm cache
+    spy_hist = pc.get_history(spy_ticker)
 
-    cagrs: list[float | None] = []
+    if spy_hist.empty:
+        out["spy_forward_cagr"] = pd.array(
+            [None] * len(out), dtype="Float64",
+        )
+        return out
+
+    # Same horizon → constant denominator. The scalar implementation also
+    # computed years from the fixed (end_date - trade_date) span, so this
+    # is identical to the per-row math.
     horizon_days = int(365.25 * label_horizon_years)
-    for trade_date in out["trade_date"]:
-        td = pd.Timestamp(trade_date).date()
-        end = td + timedelta(days=horizon_days)
-        cagr = pc.forward_total_return_cagr(spy_ticker, td, end)
-        cagrs.append(cagr)
-    out["spy_forward_cagr"] = cagrs
+    years = horizon_days / 365.25
+
+    # Cache the adjusted-close series as a numpy array indexed by sorted
+    # timestamps; both required for ``np.searchsorted`` below.
+    spy_dates = spy_hist.index.values.astype("datetime64[ns]")
+    spy_adj = spy_hist["Adj Close"].to_numpy(dtype=float, copy=False)
+
+    trade_ts = pd.to_datetime(out["trade_date"]).to_numpy("datetime64[ns]")
+    end_ts = trade_ts + np.timedelta64(horizon_days, "D")
+
+    # ``side='right'`` then ``-1`` is "last index whose timestamp is <= target".
+    start_idx = np.searchsorted(spy_dates, trade_ts, side="right") - 1
+    end_idx = np.searchsorted(spy_dates, end_ts, side="right") - 1
+
+    valid = (start_idx >= 0) & (end_idx >= 0)
+    if valid.any():
+        # Clip is just to make fancy indexing safe on the False entries; we
+        # mask them out below with ``np.where``.
+        s_safe = np.clip(start_idx, 0, len(spy_adj) - 1)
+        e_safe = np.clip(end_idx, 0, len(spy_adj) - 1)
+        p0 = spy_adj[s_safe]
+        p1 = spy_adj[e_safe]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cagr = np.where(
+                (p0 > 0) & valid,
+                (p1 / p0) ** (1.0 / years) - 1.0,
+                np.nan,
+            )
+    else:
+        cagr = np.full(len(out), np.nan, dtype=float)
+
+    # Mirror the per-row return type: ``None`` when undefined, otherwise a
+    # Python float. Using a pandas nullable Float64 keeps NaN distinct from
+    # 0 without disturbing downstream consumers that already handle NaN.
+    cagr_series = pd.Series(cagr, dtype="Float64", index=out.index)
+    cagr_series = cagr_series.mask(cagr_series.isna(), pd.NA)
+    out["spy_forward_cagr"] = cagr_series
     return out
 
 

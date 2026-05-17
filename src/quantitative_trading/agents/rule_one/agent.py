@@ -307,7 +307,11 @@ class RuleOneAgent:
         return None
 
     def _fiscal_year_ends_from_facts(
-        self, ticker: str, as_of: date,
+        self,
+        ticker: str,
+        as_of: date,
+        *,
+        pit: PointInTimeFacts | None = None,
     ) -> dict[int, date | None]:
         """Map fiscal year → official period-end date for the recent window.
 
@@ -315,11 +319,15 @@ class RuleOneAgent:
         it can compute a historical average PE. Returns ``{}`` if EDGAR
         access fails — the calculator is robust to a missing mapping
         (it just skips the historical-PE input).
+
+        Accepts an optional shared ``PointInTimeFacts`` so the agent's
+        one-PIT-per-evaluate policy avoids a redundant SEC parse here.
         """
         try:
-            cik = self._edgar.get_cik(ticker)
-            facts = self._edgar.get_company_facts(cik)
-            pit = PointInTimeFacts(facts)
+            if pit is None:
+                cik = self._edgar.get_cik(ticker)
+                facts = self._edgar.get_company_facts(cik)
+                pit = PointInTimeFacts(facts)
             latest_fy = pit.latest_fiscal_year_with_data("revenue", as_of)
             if latest_fy is None:
                 return {}
@@ -334,6 +342,24 @@ class RuleOneAgent:
             )
             return {}
 
+    def _load_pit_facts(self, ticker: str) -> PointInTimeFacts | None:
+        """Load company facts once per ``evaluate`` and wrap as PIT.
+
+        Returns ``None`` when SEC data is unreachable so the caller can
+        fall through to the per-analyzer fallback (which now triggers a
+        warning but keeps the previous semantics: the analyzer surfaces
+        an unable / no-data result).
+        """
+        try:
+            cik = self._edgar.get_cik(ticker)
+            facts = self._edgar.get_company_facts(cik)
+            return PointInTimeFacts(facts)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "PointInTimeFacts load failed for %s: %s", ticker, exc,
+            )
+            return None
+
     def evaluate(
         self,
         ticker: str,
@@ -344,7 +370,15 @@ class RuleOneAgent:
         include_management: bool = True,
         ticker_masked: bool = False,
     ) -> AgentResult:
-        big_five = self._b5.evaluate(ticker, as_of)
+        # Load companyfacts + wrap in PIT once per (ticker, as_of) and thread
+        # the same instance through Big 5, Sticker, QuantExtras, 4Ms, and the
+        # Management bundler. Without this every analyzer re-parses the same
+        # JSON (~3-4x duplicate work per call). Analyzers still fall back to
+        # internal load when ``pit_facts is None``, so single-analyzer
+        # callers and tests are unaffected.
+        pit = self._load_pit_facts(ticker)
+
+        big_five = self._b5.evaluate(ticker, as_of, pit_facts=pit)
         eps_growth = big_five.eps_growth.value  # may be None if insufficient data
 
         # Pass the EPS-in-today's-basis history + per-FY end dates from
@@ -352,20 +386,23 @@ class RuleOneAgent:
         # uses them to compute a historical average PE — one of the
         # documented inputs to the future-PE cap.
         eps_history = dict(big_five.eps_growth.series or {})
-        fiscal_year_ends = self._fiscal_year_ends_from_facts(ticker, as_of)
+        fiscal_year_ends = self._fiscal_year_ends_from_facts(
+            ticker, as_of, pit=pit,
+        )
 
         sticker, payback = self._sp.evaluate(
             ticker, as_of,
             historical_eps_growth=eps_growth,
             eps_history=eps_history,
             fiscal_year_ends=fiscal_year_ends,
+            pit_facts=pit,
         )
 
         quant_extras: QuantExtrasResult | None = None
         if include_extras:
             try:
                 quant_extras = self._extras.evaluate(
-                    ticker, as_of, big_five=big_five
+                    ticker, as_of, big_five=big_five, pit_facts=pit,
                 )
             except Exception as exc:  # noqa: BLE001
                 log.warning("QuantExtras failed for %s @ %s: %s", ticker, as_of, exc)
@@ -375,7 +412,7 @@ class RuleOneAgent:
         if include_llm and self._four_ms is not None:
             try:
                 four_ms = self._four_ms.evaluate(
-                    ticker, as_of, ticker_masked=ticker_masked
+                    ticker, as_of, ticker_masked=ticker_masked, pit_facts=pit,
                 )
             except Exception as exc:  # noqa: BLE001
                 log.warning("4Ms LLM failed for %s @ %s: %s", ticker, as_of, exc)
@@ -390,6 +427,7 @@ class RuleOneAgent:
                 management = self._management.evaluate(
                     ticker, as_of,
                     capital_allocation_context=cap_alloc_ctx,
+                    pit_facts=pit,
                 )
             except Exception as exc:  # noqa: BLE001
                 log.warning("Management LLM failed for %s @ %s: %s",

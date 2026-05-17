@@ -156,20 +156,30 @@ def sample_controls(
     # in the same stratum reuse the candidate pool.
     candidates_cache: dict[tuple[date, int], list[tuple[str, int, int]]] = {}
 
-    for i, buy in elite_evaluable.iterrows():
-        elite_ticker = buy["ticker"]
-        elite_cusip = buy["cusip"]
+    # ``itertuples(index=False)`` avoids the per-row Series construction
+    # ``iterrows`` pays — the inner loop calls ``agent.evaluate`` per
+    # candidate, so the iteration overhead is small relative to total
+    # runtime, but cutting it costs nothing. ``enumerate`` replaces the
+    # iterrows index (which carries over the original DataFrame index and
+    # is therefore non-sequential after filtering); the only observable
+    # consumer is a progress log every 10 rows, which is now consistently
+    # 1..N rather than the upstream index value.
+    for i, buy in enumerate(elite_evaluable.itertuples(index=False)):
+        elite_ticker = buy.ticker
+        elite_cusip = buy.cusip
+        period_raw = buy.period_of_report
         elite_period = (
-            buy["period_of_report"]
-            if isinstance(buy["period_of_report"], date)
-            else date.fromisoformat(str(buy["period_of_report"]))
+            period_raw
+            if isinstance(period_raw, date)
+            else date.fromisoformat(str(period_raw))
         )
+        t_eval_raw = buy.t_eval
         t_eval = (
-            buy["t_eval"]
-            if isinstance(buy["t_eval"], date)
-            else date.fromisoformat(str(buy["t_eval"]))
+            t_eval_raw
+            if isinstance(t_eval_raw, date)
+            else date.fromisoformat(str(t_eval_raw))
         )
-        elite_sic = buy.get("sic_code")
+        elite_sic = getattr(buy, "sic_code", None)
         if elite_sic is None or pd.isna(elite_sic):
             log.debug("Skipping elite buy without SIC: %s", elite_ticker)
             continue
@@ -212,7 +222,7 @@ def sample_controls(
             # (it would be `young_company` in the elite analogy).
             if booleans is None or (years_history or 0) < BIG_FIVE_HORIZON_YEARS:
                 rows.append(ControlRow(
-                    elite_investor_short_id=buy["investor_short_id"],
+                    elite_investor_short_id=buy.investor_short_id,
                     elite_cusip=elite_cusip,
                     elite_ticker=elite_ticker,
                     elite_period_of_report=elite_period,
@@ -233,7 +243,7 @@ def sample_controls(
             big5_pass = all(booleans[k] for k in big5_keys)
             all7 = all(booleans.values())
             rows.append(ControlRow(
-                elite_investor_short_id=buy["investor_short_id"],
+                elite_investor_short_id=buy.investor_short_id,
                 elite_cusip=elite_cusip,
                 elite_ticker=elite_ticker,
                 elite_period_of_report=elite_period,

@@ -340,10 +340,19 @@ class BigFiveAnalyzer:
         *,
         n_years: int = DEFAULT_N_YEARS,
         threshold: float = DEFAULT_THRESHOLD,
+        pit_facts: PointInTimeFacts | None = None,
     ) -> BigFiveResult:
-        cik = self._edgar.get_cik(ticker)
-        facts = self._edgar.get_company_facts(cik)
-        pit = PointInTimeFacts(facts)
+        # Allow the caller (e.g. ``RuleOneAgent.evaluate``) to amortise the
+        # company-facts JSON parse + PIT construction across multiple
+        # analyzers for the same (ticker, as_of). Fall back to the historical
+        # path when no shared PIT is supplied so single-analyzer callers and
+        # tests still work unchanged.
+        if pit_facts is not None:
+            pit = pit_facts
+        else:
+            cik = self._edgar.get_cik(ticker)
+            facts = self._edgar.get_company_facts(cik)
+            pit = PointInTimeFacts(facts)
 
         latest_fy = pit.latest_fiscal_year_with_data("revenue", as_of)
         if latest_fy is None:
