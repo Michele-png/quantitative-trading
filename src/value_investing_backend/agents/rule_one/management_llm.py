@@ -5,20 +5,56 @@ pipeline that scores Phil Town's specific psychological / linguistic markers:
 
     1. **Blame Test** (transcripts) — Does the CEO take personal
        responsibility for misses, or scapegoat macro / weather / FX?
+       Tri-state: pass / neutral / hard_fail (attribution vs deflection
+       — see ``BlameEvaluator``).
     2. **Long-Term vs Short-Term** (transcripts + shareholder letter) —
        Does language emphasize quarterly beats and stock price, or decade-
-       long vision and intrinsic value?
-    3. **Clarity vs Jargon** (shareholder letter) — Plain English, or
-       corporate jargon designed to obscure?
+       long vision and intrinsic value? Tri-state: ``long`` = pass,
+       ``mixed`` = neutral, ``short`` = hard_fail.
+    3. **Clarity vs Jargon** (shareholder letter, MD&A, or Item 1
+       fallback) — Plain English, or corporate jargon designed to
+       obscure? Source-aware thresholds: MD&A and Item 1 are not held
+       to Buffett-letter standards.
     4. **Compensation Alignment** (DEF 14A CD&A) — Are CEO incentives tied
        to per-share value (ROIC, EPS, FCF/share), or to revenue / adjusted
-       EBITDA, which encourage empire-building?
-    5. **Insider Alignment** (Form 4) — Net open-market buying by named
-       officers and directors over the last 24 months, no large coordinated
-       sells in the last 90 days. Deterministic — no LLM call.
+       EBITDA, which encourage empire-building? Tri-state: explicit
+       empire-building → hard_fail; mixed → neutral.
+    5. **Insider Alignment** (Form 4) — Deterministic tri-state:
+       meaningful net open-market buying → pass; large recent non-plan
+       selling → hard_fail; absence of activity → neutral (the norm for
+       stock-comp-paid mega-cap executives).
+    6. **Capital Allocation** — Combines deterministic XBRL signals
+       (dilution, ROIC, FCF conversion, dividend quality) with an LLM
+       read of MD&A + letter. Tri-state: deterministic concerns →
+       hard_fail; clean → pass; LLM-flagged-only → neutral.
 
-Aggregate ``ManagementResult.passes`` is the AND of all five. The dashboard
-also surfaces each sub-check individually so partial failures are visible.
+Aggregate verdict is computed by ``ManagementResult.decision()``: any
+``hard_fail`` sub-check fails the pillar; fewer than three usable
+sub-checks → ``no_data`` (missing data cannot pass); otherwise the
+mix of clean/neutral/partial evidence drives ``pass`` / ``neutral``.
+See ``ManagementDecision`` for the full rule contract.
+
+Rollout / cache invalidation
+----------------------------
+
+Every ``ManagementResult`` is cached on disk keyed by
+``(ticker, fiscal_year, bundle_hash, model, thinking_budget,
+PROMPT_VERSION, EVIDENCE_SCHEMA_VERSION)``. Bumping ``PROMPT_VERSION``
+(prompt or per-sub-check pass rule changes) or
+``EVIDENCE_SCHEMA_VERSION`` (new fields on ``SubCheck`` /
+``ManagementDecision`` / evidence blob) forces fresh LLM evaluations
+the next time the pipeline runs. The dashboard reads both new and old
+evidence blobs (decision block optional) so deploy order is:
+
+  1. Deploy backend code that emits the new evidence contract.
+  2. Deploy dashboard code that tolerates old and new blobs.
+  3. (Operator) Backfill management source documents for affected
+     tickers via ``etl/backfill_management_sources.py`` so the new
+     run has full source coverage.
+  4. (Operator) Re-run weekly refresh for affected tickers; the bumped
+     cache key forces fresh management decisions.
+  5. (Optional) Delete stale entries from ``llm_cache_dir/management``
+     after the new rows are verified.
 """
 
 from __future__ import annotations
@@ -31,7 +67,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from value_investing_backend.agents.rule_one.four_ms_llm import (
     extract_10k_sections,
@@ -63,11 +99,79 @@ log = logging.getLogger(__name__)
 
 # v1: original 5-subcheck pipeline.
 # v2: adds CapitalAllocation, renames the 10-K Item 1 fallback source.
-PROMPT_VERSION = "v2"
+# v3: adds explicit SubCheck.outcome (pass/neutral/hard_fail/no_data/...)
+#     and ManagementDecision aggregate. Recalibrates Insider (no buys =
+#     neutral), Blame (attribution vs deflection), LongShort (mixed =
+#     neutral), Clarity (source-aware threshold), CapitalAllocation
+#     (warning vs hard_fail). All cached LLM results invalidate on this
+#     bump so old strict-AND outputs cannot survive the rollout.
+PROMPT_VERSION = "v3"
 DEFAULT_TRANSCRIPT_QUARTERS = 8
 DEF14A_CHARS_BUDGET = 200_000   # CD&A sections can be long; budget ~50k tokens.
 TRANSCRIPT_CHARS_BUDGET = 60_000  # Per transcript; ~15k tokens each.
 LETTER_CHARS_BUDGET = 80_000
+
+
+# --------------------------------------------------------------------------
+# Decision-model vocabulary
+# --------------------------------------------------------------------------
+#
+# Every sub-check carries an explicit ``outcome`` plus the legacy
+# ``passes`` boolean. The aggregate ``ManagementDecision`` is computed
+# from these outcomes so missing data and neutral signals never silently
+# convert into a clean management pass or a clean fail.
+#
+#   * ``pass``         — positive, evaluated evidence for the sub-check.
+#   * ``neutral``      — evaluated evidence exists but is neither a
+#                        positive nor a red-flag signal (e.g. no
+#                        qualifying open-market insider buys without any
+#                        large non-plan sells; an earnings call that
+#                        reads "mixed" without short-term obsession).
+#   * ``hard_fail``    — evaluated evidence shows a real red flag (e.g.
+#                        large recent non-plan insider selling, clear
+#                        blame deflection, compensation dominated by
+#                        empire-building metrics).
+#   * ``no_data``      — the required source is absent so the check was
+#                        not meaningfully evaluated.
+#   * ``partial_data`` — the source exists but is degraded, incomplete,
+#                        or not the preferred source (e.g. Item 1
+#                        fallback used in place of a shareholder
+#                        letter).
+#   * ``error``        — the evaluator failed operationally.
+
+SubCheckOutcome = Literal[
+    "pass", "neutral", "hard_fail", "no_data", "partial_data", "error",
+]
+
+OUTCOME_PASS: SubCheckOutcome = "pass"
+OUTCOME_NEUTRAL: SubCheckOutcome = "neutral"
+OUTCOME_HARD_FAIL: SubCheckOutcome = "hard_fail"
+OUTCOME_NO_DATA: SubCheckOutcome = "no_data"
+OUTCOME_PARTIAL_DATA: SubCheckOutcome = "partial_data"
+OUTCOME_ERROR: SubCheckOutcome = "error"
+
+USABLE_OUTCOMES: frozenset[SubCheckOutcome] = frozenset({
+    OUTCOME_PASS, OUTCOME_NEUTRAL, OUTCOME_HARD_FAIL, OUTCOME_PARTIAL_DATA,
+})
+"""Outcomes that count as "we actually looked at usable evidence" when
+deciding whether the aggregate Management decision has enough material
+to render a verdict. ``no_data`` and ``error`` do not count."""
+
+# Minimum number of usable sub-checks needed before the aggregate
+# decision can be anything other than ``no_data``. With 6 sub-checks
+# this requires at least half of them to have real evidence.
+MIN_USABLE_SUBCHECKS_FOR_DECISION = 3
+
+# Minimum number of clean ``pass`` outcomes needed to call the aggregate
+# Management decision a clean ``pass``. Below this threshold the
+# decision degrades to ``neutral`` even with no hard failures.
+MIN_CLEAN_PASSES_FOR_DECISION = 2
+
+
+# Evidence-blob schema version. Bumped alongside ``PROMPT_VERSION``
+# whenever the management evidence shape changes (new fields, new
+# sub-check outcomes, new aggregate decision block).
+EVIDENCE_SCHEMA_VERSION = 2
 
 
 # --------------------------------------------------------------------------
@@ -112,13 +216,36 @@ class DocumentBundle:
 
 @dataclass(frozen=True)
 class SubCheck:
-    """One sub-check inside the Management aggregator."""
+    """One sub-check inside the Management aggregator.
+
+    The new ``outcome`` field is the source of truth for the aggregate
+    Management decision. ``passes`` is preserved for backward
+    compatibility (cached results, the ``screen_passes`` boolean
+    columns, older tests) and is derived from ``outcome`` when an
+    evaluator only supplies one or the other.
+
+    Allowed ``outcome`` values are defined by ``SubCheckOutcome``: see
+    the module-level decision-model vocabulary for the contract.
+    """
 
     name: str
     passes: bool
     score: float | None  # 1..10 for clarity, 0..1 for ratios; None when n/a
     rationale: str
     details: dict[str, Any] = field(default_factory=dict)
+    outcome: SubCheckOutcome | None = None
+
+    @property
+    def resolved_outcome(self) -> SubCheckOutcome:
+        """Return the explicit ``outcome`` when set, else derive from
+        ``passes`` so cached results without the new field still produce
+        a stable status.
+        """
+        if self.outcome is not None:
+            return self.outcome
+        if self.details.get("error"):
+            return OUTCOME_ERROR
+        return OUTCOME_PASS if self.passes else OUTCOME_HARD_FAIL
 
 
 def _safe_eval(name: str, fn: Callable[[], SubCheck]) -> SubCheck:
@@ -140,6 +267,7 @@ def _safe_eval(name: str, fn: Callable[[], SubCheck]) -> SubCheck:
             score=None,
             rationale=f"Sub-check failed: {type(exc).__name__}: {exc}"[:1000],
             details={"error": True, "exception_type": type(exc).__name__},
+            outcome=OUTCOME_ERROR,
         )
 
 
@@ -204,6 +332,59 @@ class CapitalAllocationContext:
     failures even when the headline payout looks safe."""
 
 
+ManagementDecisionOutcome = Literal[
+    "pass", "neutral", "hard_fail", "no_data", "error",
+]
+
+
+@dataclass(frozen=True)
+class ManagementDecision:
+    """Aggregate verdict over the Management sub-checks.
+
+    Replaces the legacy "AND of every sub-check" gate. The aggregate
+    rule:
+
+        * Any sub-check with ``outcome=="hard_fail"`` produces a
+          ``hard_fail`` decision regardless of other evidence.
+        * Fewer than ``MIN_USABLE_SUBCHECKS_FOR_DECISION`` usable
+          sub-checks (pass / neutral / hard_fail / partial_data) → the
+          aggregate decision is ``no_data``. Missing evidence cannot be
+          silently converted into a pass.
+        * Otherwise, a clean ``pass`` requires no hard failures, at
+          least ``MIN_CLEAN_PASSES_FOR_DECISION`` clean ``pass``
+          outcomes, and a majority of usable evidence to be clean
+          rather than ``partial_data``.
+        * Anything else with usable evidence and no hard failures lands
+          in ``neutral`` — usable signal exists, but not enough positive
+          evidence to call it a clean pass.
+
+    The intent: hard failures still fail; missing data never passes;
+    neutral or degraded evidence remains visible as neutral instead of
+    masquerading as either green or red.
+    """
+
+    outcome: ManagementDecisionOutcome
+    hard_failures: tuple[str, ...]
+    clean_passes: tuple[str, ...]
+    neutral_subchecks: tuple[str, ...]
+    partial_subchecks: tuple[str, ...]
+    no_data_subchecks: tuple[str, ...]
+    error_subchecks: tuple[str, ...]
+    usable_evidence_count: int
+    total_subchecks: int
+    rationale: str
+
+    @property
+    def passes(self) -> bool:
+        """Compatibility shim: a clean ``pass`` aggregate decision.
+
+        ``screen_passes`` and the dashboard's hard gate use this so the
+        Management pillar only goes green when the aggregate rule is
+        actually satisfied.
+        """
+        return self.outcome == "pass"
+
+
 @dataclass(frozen=True)
 class ManagementResult:
     """Aggregate Management evaluation."""
@@ -224,10 +405,9 @@ class ManagementResult:
     """Capital-allocation sub-check (Phase 5).
 
     ``None`` when the cached entry pre-dates the introduction of the
-    sub-check; new runs always populate it. The aggregate ``passes``
-    treats a ``None`` capital allocation as a soft pass — older cache
-    entries don't suddenly start failing the gate just because the
-    schema gained a slot.
+    sub-check; new runs always populate it. The aggregate decision
+    treats a ``None`` capital allocation as missing evidence so older
+    cache entries don't silently inflate the usable-evidence count.
     """
 
     coverage: SourceCoverage | None = None
@@ -238,8 +418,109 @@ class ManagementResult:
     can distinguish ``no_data`` from ``fail`` per sub-check.
     """
 
+    def _ordered_subchecks(self) -> list[tuple[str, SubCheck]]:
+        """Return the canonical (key, SubCheck) list, skipping
+        ``capital_allocation`` for legacy cache entries that pre-date
+        the sub-check.
+        """
+        out: list[tuple[str, SubCheck]] = [
+            ("blame", self.blame),
+            ("long_short", self.long_short),
+            ("clarity", self.clarity),
+            ("compensation", self.compensation),
+            ("insider", self.insider),
+        ]
+        if self.capital_allocation is not None:
+            out.append(("capital_allocation", self.capital_allocation))
+        return out
+
+    def decision(self) -> ManagementDecision:
+        """Compute the aggregate Management decision from sub-check outcomes.
+
+        Pure function over the current ``SubCheck`` instances. See
+        ``ManagementDecision`` for the aggregate rule contract.
+        """
+        ordered = self._ordered_subchecks()
+        total = len(ordered)
+        buckets: dict[SubCheckOutcome, list[str]] = {
+            OUTCOME_PASS: [],
+            OUTCOME_NEUTRAL: [],
+            OUTCOME_HARD_FAIL: [],
+            OUTCOME_PARTIAL_DATA: [],
+            OUTCOME_NO_DATA: [],
+            OUTCOME_ERROR: [],
+        }
+        for key, sub in ordered:
+            buckets[sub.resolved_outcome].append(key)
+
+        usable = (
+            buckets[OUTCOME_PASS]
+            + buckets[OUTCOME_NEUTRAL]
+            + buckets[OUTCOME_HARD_FAIL]
+            + buckets[OUTCOME_PARTIAL_DATA]
+        )
+        usable_count = len(usable)
+
+        outcome: ManagementDecisionOutcome
+        if buckets[OUTCOME_HARD_FAIL]:
+            outcome = "hard_fail"
+        elif usable_count < MIN_USABLE_SUBCHECKS_FOR_DECISION:
+            outcome = "no_data"
+        else:
+            clean = len(buckets[OUTCOME_PASS])
+            partial = len(buckets[OUTCOME_PARTIAL_DATA])
+            neutral = len(buckets[OUTCOME_NEUTRAL])
+            if (
+                clean >= MIN_CLEAN_PASSES_FOR_DECISION
+                and clean >= partial
+                and clean + neutral >= partial
+            ):
+                outcome = "pass"
+            else:
+                outcome = "neutral"
+
+        rationale = (
+            f"{usable_count}/{total} usable sub-checks; "
+            f"pass={len(buckets[OUTCOME_PASS])}, "
+            f"neutral={len(buckets[OUTCOME_NEUTRAL])}, "
+            f"hard_fail={len(buckets[OUTCOME_HARD_FAIL])}, "
+            f"partial_data={len(buckets[OUTCOME_PARTIAL_DATA])}, "
+            f"no_data={len(buckets[OUTCOME_NO_DATA])}, "
+            f"error={len(buckets[OUTCOME_ERROR])} "
+            f"→ decision={outcome}"
+        )
+        return ManagementDecision(
+            outcome=outcome,
+            hard_failures=tuple(buckets[OUTCOME_HARD_FAIL]),
+            clean_passes=tuple(buckets[OUTCOME_PASS]),
+            neutral_subchecks=tuple(buckets[OUTCOME_NEUTRAL]),
+            partial_subchecks=tuple(buckets[OUTCOME_PARTIAL_DATA]),
+            no_data_subchecks=tuple(buckets[OUTCOME_NO_DATA]),
+            error_subchecks=tuple(buckets[OUTCOME_ERROR]),
+            usable_evidence_count=usable_count,
+            total_subchecks=total,
+            rationale=rationale,
+        )
+
     @property
     def passes(self) -> bool:
+        """Aggregate Management pass.
+
+        Backed by ``ManagementDecision`` so the orchestrator hard gate
+        no longer fails on missing/neutral evidence and no longer
+        passes when every leg is ``no_data``. The legacy strict AND is
+        still available via ``strict_all_legs_pass`` for diagnostics.
+        """
+        return self.decision().outcome == "pass"
+
+    @property
+    def strict_all_legs_pass(self) -> bool:
+        """Legacy strict AND of every sub-check's ``passes`` boolean.
+
+        Kept for diagnostics and backward compatibility (e.g. tests
+        that audited the old gate); not used by the dashboard hard
+        gate. Prefer ``decision()`` for any new logic.
+        """
         legs = [
             self.blame.passes, self.long_short.passes, self.clarity.passes,
             self.compensation.passes, self.insider.passes,
@@ -262,6 +543,7 @@ class ManagementResult:
         return out
 
     def summary(self) -> str:
+        decision = self.decision()
         lines = [f"Management({self.ticker} as_of {self.as_of}, FY={self.fiscal_year}):"]
         subs = [
             self.blame, self.long_short, self.clarity,
@@ -270,9 +552,9 @@ class ManagementResult:
         if self.capital_allocation is not None:
             subs.append(self.capital_allocation)
         for sub in subs:
-            tag = "OK" if sub.passes else "FAIL"
+            tag = sub.resolved_outcome.upper()
             lines.append(f"  {sub.name:>18s}: {tag}  {sub.rationale[:120]}")
-        lines.append(f"  ALL PASS: {self.passes}")
+        lines.append(f"  DECISION: {decision.outcome.upper()}  {decision.rationale}")
         return "\n".join(lines)
 
 
@@ -554,9 +836,17 @@ class DocumentBundler:
             if archive_letter is not None
             else def14a_letter_text
         )
+        # ``shareholder_letter_is_fallback`` means the slot is filled by
+        # something that isn't a real CEO-to-shareholder letter: the 10-K
+        # Item 1 Business Description, an annual-report container without
+        # a letter section extracted, or generic IR material. Real
+        # letters come from DEF 14A proxy letters and from archive
+        # documents of type ``shareholder_letter`` / ``proxy_letter``.
         shareholder_letter_is_fallback = False
         if archive_letter is not None:
             source_documents["shareholder_letter"] = _archive_doc_evidence(archive_letter)
+            if archive_letter.doc_type not in {"shareholder_letter", "proxy_letter"}:
+                shareholder_letter_is_fallback = True
         if not shareholder_letter_text and filing is not None:
             try:
                 doc_html = self._edgar.fetch_filing_document(
@@ -875,14 +1165,35 @@ _COMP_TOOL = {
 _BLAME_SYSTEM = """You are a senior equity analyst applying Phil Town's Rule One framework.
 Your single task is the BLAME TEST: when the CEO discusses missed targets or
 revenue drops in earnings calls, do they take PERSONAL responsibility, or do
-they BLAME external factors (macro headwinds, weather, supply chain, FX)?
+they BLAME external factors?
 
-PASS examples: "We made a mistake in inventory forecasting." "I underestimated
-how long the integration would take." "That was on me."
-FAIL examples: "Macro headwinds and currency fluctuations impacted our bottom
-line." "Weather affected store traffic." "Supply chain disruption hurt margins."
+Crucially, distinguish ATTRIBUTION from DEFLECTION:
 
-Be conservative. Use ONLY the supplied transcripts. Cite specific quotes.
+  * ATTRIBUTION — factual context. "Q3 revenue grew 5%, partially offset
+    by a 200 bps FX headwind." This is normal disclosure and is NOT
+    blame. Every public-company CEO must describe macro context; the
+    presence of macro language alone is not a red flag.
+  * DEFLECTION — using external factors as the EXPLANATION for missing
+    plan. "We missed because of macro headwinds." "Weather hurt
+    traffic, that's why store sales fell." Here the macro language is
+    doing the work of avoiding accountability.
+
+Count "scapegoats" ONLY when the CEO uses external factors to deflect
+responsibility for a miss — not when they merely mention macro context as
+part of describing results.
+
+PASS examples (clear accountability):
+  * "We made a mistake in inventory forecasting."
+  * "I underestimated how long the integration would take."
+  * "That was on me; we'll do better next quarter."
+
+DEFLECTION examples (real scapegoats):
+  * "Macro headwinds and currency fluctuations are the reason we missed."
+  * "Weather affected store traffic, which drove the comparable miss."
+  * "Supply chain disruption is why margins were below guidance."
+
+Be conservative on DEFLECTION counting. Use ONLY the supplied transcripts.
+Cite specific quotes for both takes_responsibility and scapegoat_count.
 """
 
 
@@ -893,25 +1204,63 @@ versus LONG-TERM language (decade-long vision, customer obsession, intrinsic
 value, durable moat).
 
 A long-term-oriented CEO talks about strategy spanning years; a short-term-
-oriented CEO obsesses over the next print. Be conservative — when in doubt,
-classify as "mixed" or "short". Use ONLY the supplied materials.
+oriented CEO obsesses over the next print.
+
+Classification rules (apply strictly, do not default to "mixed" to be safe):
+
+  * "long"  -- strategic, multi-year language clearly dominates. Earnings
+              calls always include some discussion of quarterly results;
+              that does NOT disqualify "long" so long as the substantive
+              narrative is about multi-year reinvestment, durable
+              advantages, customer outcomes, or capital allocation.
+  * "mixed" -- short-term and long-term language are both substantial
+              and neither dominates. This is a NEUTRAL signal, not a
+              negative one: many earnings calls fall here.
+  * "short" -- short-term language clearly dominates AND there is little
+              or no substantive multi-year framing. A genuine red flag
+              for management quality.
+
+Use ONLY the supplied materials. Cite specific quotes for whichever class
+you choose.
 """
 
 
 _CLARITY_SYSTEM = """You are a senior equity analyst applying Phil Town's Rule One framework.
 Your single task is the CLARITY TEST: rate from 1 to 10 how clearly the
-CEO's annual letter / MD&A is written. Plain English with concrete numbers
-and intuitive metaphors scores HIGH. Corporate jargon, defined-terms-laundering,
+supplied document is written. Plain English with concrete numbers and
+intuitive metaphors scores HIGH. Corporate jargon, defined-terms-laundering,
 acronym soups, and "synergistic optimization" prose scores LOW.
 
-Anchor scores:
-  10 = Buffett / Bezos letter quality
-  7  = Honest, readable, mostly plain
-  5  = Mixed — readable in places, jargon in others
-  3  = Jargon-heavy with little useful information
-  1  = Essentially impossible to extract substance from
+Anchor scores (calibrate to the source type, which is named in the
+user message as "Source: <doc_label>"):
 
-Be conservative. Use ONLY the supplied text.
+  Shareholder letter (DEF 14A letter or archived CEO letter):
+    10 = Buffett / Bezos letter quality
+     7 = Honest, readable, mostly plain
+     5 = Mixed — readable in places, jargon in others
+     3 = Jargon-heavy with little useful information
+     1 = Essentially impossible to extract substance from
+
+  10-K Item 7 (MD&A):
+    10 = Exceptionally lucid MD&A — concrete dollar numbers, candid
+         tradeoffs, almost no defined-terms laundering.
+     7 = Above-average MD&A — segment commentary in plain dollar terms,
+         minimal acronym soup. (Note: MD&A is a legal/accounting
+         product, so a 7 here is genuinely strong, not lukewarm.)
+     5 = Standard MD&A — readable in places, jargon in others.
+     3 = MD&A dominated by GAAP boilerplate / acronym soup.
+     1 = Pure legalese.
+
+  10-K Item 1 (Business description) — FALLBACK source:
+     Item 1 is a regulatory product description, not a letter. Do
+     NOT penalise it for being descriptive. Score 1..10 on whether the
+     description is intelligible and concrete, but understand the
+     dashboard will downgrade the resulting status to PARTIAL DATA
+     regardless because this is not the intended source.
+
+Be conservative on jargon-counting but DO NOT apply Buffett-letter
+standards to MD&A / Item 1 material — they are different document
+classes. Use ONLY the supplied text.
 """
 
 
@@ -968,6 +1317,14 @@ def _format_transcripts(transcripts: list[EarningsTranscript]) -> str:
 
 
 class BlameEvaluator:
+    # Calibration thresholds for the Blame outcome:
+    #   * Up to ``_NEUTRAL_SCAPEGOAT_CEILING`` deflection moments is the
+    #     "normal earnings-call noise" band — neither a clean
+    #     accountability signal nor a clear red flag.
+    #   * Beyond that, persistent deflection is treated as ``hard_fail``.
+    _NEUTRAL_SCAPEGOAT_CEILING = 2
+    _HARD_FAIL_SCAPEGOAT_FLOOR = 5
+
     def __init__(self, llm: LlmClient) -> None:
         self._llm = llm
 
@@ -976,6 +1333,7 @@ class BlameEvaluator:
             return SubCheck(
                 name="Blame", passes=False, score=None,
                 rationale="No earnings call transcripts available.",
+                outcome=OUTCOME_NO_DATA,
             )
         body = _format_transcripts(bundle.transcripts)
         body = self._llm.truncate(body)
@@ -994,12 +1352,25 @@ class BlameEvaluator:
         payload = result.payload
         takes_resp = bool(payload.get("takes_responsibility", False))
         scapegoats = int(payload.get("scapegoat_count", 0) or 0)
-        passes = takes_resp and scapegoats <= 2
+        # Tri-state outcome:
+        # * pass: takes responsibility AND low deflection count.
+        # * hard_fail: persistent deflection beyond the floor, OR
+        #   explicitly does not take responsibility while deflecting.
+        # * neutral: in-between — typical earnings-call mix where some
+        #   macro framing exists but is not used to dodge ownership.
+        if takes_resp and scapegoats <= self._NEUTRAL_SCAPEGOAT_CEILING:
+            outcome: SubCheckOutcome = OUTCOME_PASS
+        elif scapegoats >= self._HARD_FAIL_SCAPEGOAT_FLOOR and not takes_resp:
+            outcome = OUTCOME_HARD_FAIL
+        else:
+            outcome = OUTCOME_NEUTRAL
+        passes = outcome == OUTCOME_PASS
         return SubCheck(
             name="Blame",
             passes=passes,
             score=float(scapegoats),
             rationale=str(payload.get("rationale", ""))[:1000],
+            outcome=outcome,
             details={
                 "takes_responsibility": takes_resp,
                 "scapegoat_count": scapegoats,
@@ -1032,6 +1403,7 @@ class LongShortEvaluator:
             return SubCheck(
                 name="LongShort", passes=False, score=None,
                 rationale="No shareholder letter or transcripts available.",
+                outcome=OUTCOME_NO_DATA,
             )
         body = self._llm.truncate("".join(materials_parts))
         result = self._llm.call(
@@ -1043,11 +1415,11 @@ class LongShortEvaluator:
             tool=_LONG_SHORT_TOOL,
             dry_run_payload={
                 "short_term_mentions": 0, "long_term_mentions": 0,
-                "dominant_orientation": "short", "rationale": "[dry-run]",
+                "dominant_orientation": "mixed", "rationale": "[dry-run]",
             },
         )
         payload = result.payload
-        orientation = str(payload.get("dominant_orientation", "short")).lower()
+        orientation = str(payload.get("dominant_orientation", "mixed")).lower()
         long_n = int(payload.get("long_term_mentions", 0) or 0)
         short_n = int(payload.get("short_term_mentions", 0) or 0)
         ratio = (
@@ -1055,12 +1427,27 @@ class LongShortEvaluator:
             if payload.get("ratio") is not None
             else long_n / max(short_n, 1)
         )
-        passes = orientation == "long"
+        # Tri-state outcome:
+        # * ``long`` → clean pass (strategic narrative dominates).
+        # * ``mixed`` → neutral (both signals present; the norm for
+        #   earnings-call material, especially when the only source is
+        #   transcripts or the Item 1 fallback).
+        # * ``short`` → hard fail (quarterly-print obsession dominates).
+        # Anything unrecognised falls through to ``neutral`` so a
+        # prompt drift cannot silently fail the gate.
+        if orientation == "long":
+            outcome: SubCheckOutcome = OUTCOME_PASS
+        elif orientation == "short":
+            outcome = OUTCOME_HARD_FAIL
+        else:
+            outcome = OUTCOME_NEUTRAL
+        passes = outcome == OUTCOME_PASS
         return SubCheck(
             name="LongShort",
             passes=passes,
             score=float(ratio) if ratio is not None else None,
             rationale=str(payload.get("rationale", ""))[:1000],
+            outcome=outcome,
             details={
                 "short_term_mentions": short_n,
                 "long_term_mentions": long_n,
@@ -1071,6 +1458,15 @@ class LongShortEvaluator:
 
 
 class ClarityEvaluator:
+    # Pass / hard-fail thresholds vary by source so MD&A and Item 1
+    # fallback aren't held to Buffett-letter prose standards. A real
+    # shareholder letter scoring <4 is a genuine writing-quality
+    # failure; a 4/10 MD&A is just standard regulatory prose.
+    _PASS_FLOOR_LETTER = 7
+    _PASS_FLOOR_MDA = 6
+    _HARD_FAIL_CEILING_LETTER = 3
+    _HARD_FAIL_CEILING_MDA = 2
+
     def __init__(self, llm: LlmClient) -> None:
         self._llm = llm
 
@@ -1081,20 +1477,25 @@ class ClarityEvaluator:
         if bundle.shareholder_letter_text and not bundle.shareholder_letter_is_fallback:
             text = bundle.shareholder_letter_text
             doc_label = "shareholder letter"
+            source_kind = "letter"
         elif bundle.mda_text:
             text = bundle.mda_text
             doc_label = "10-K Item 7 (MD&A)"
+            source_kind = "mda"
         elif bundle.shareholder_letter_text:
             # Last-resort: the 10-K Item 1 business-description fallback.
             text = bundle.shareholder_letter_text
             doc_label = "10-K Item 1 business description (fallback)"
+            source_kind = "item1_fallback"
         else:
             text = ""
             doc_label = ""
+            source_kind = "none"
         if not text:
             return SubCheck(
                 name="Clarity", passes=False, score=None,
                 rationale="No shareholder letter or MD&A text available.",
+                outcome=OUTCOME_NO_DATA,
             )
         body = self._llm.truncate(
             f"Source: {doc_label}\n\n{text}"
@@ -1109,7 +1510,38 @@ class ClarityEvaluator:
         )
         payload = result.payload
         score = int(payload.get("clarity_score", 0) or 0)
-        passes = score >= 7
+        # Source-aware thresholds:
+        # * Real shareholder letter — pass at >=7, hard_fail at <=3.
+        # * MD&A — pass at >=6 (MD&A is harder to make readable), and
+        #   hard_fail only at the genuinely-unreadable end (<=2).
+        # * Item 1 fallback — never an outright ``pass`` from the
+        #   prompt alone; the evidence layer downgrades the status to
+        #   ``partial_data`` and the aggregate Management decision
+        #   treats it as degraded usable evidence.
+        if source_kind == "item1_fallback":
+            # Encode as partial_data so source-coverage logic and the
+            # aggregate decision are consistent. Below the hard-fail
+            # ceiling the prose is genuinely unreadable; otherwise the
+            # check is informational only.
+            if score <= self._HARD_FAIL_CEILING_MDA:
+                outcome: SubCheckOutcome = OUTCOME_HARD_FAIL
+            else:
+                outcome = OUTCOME_PARTIAL_DATA
+        elif source_kind == "mda":
+            if score >= self._PASS_FLOOR_MDA:
+                outcome = OUTCOME_PASS
+            elif score <= self._HARD_FAIL_CEILING_MDA:
+                outcome = OUTCOME_HARD_FAIL
+            else:
+                outcome = OUTCOME_NEUTRAL
+        else:  # source_kind == "letter"
+            if score >= self._PASS_FLOOR_LETTER:
+                outcome = OUTCOME_PASS
+            elif score <= self._HARD_FAIL_CEILING_LETTER:
+                outcome = OUTCOME_HARD_FAIL
+            else:
+                outcome = OUTCOME_NEUTRAL
+        passes = outcome == OUTCOME_PASS
         rationale = str(payload.get("rationale", ""))[:1000]
         # Surface the source label so the dashboard / cache reflects
         # which document the clarity score is actually about.
@@ -1119,8 +1551,10 @@ class ClarityEvaluator:
             passes=passes,
             score=float(score),
             rationale=rationale,
+            outcome=outcome,
             details={
                 "scored_from": doc_label,
+                "source_kind": source_kind,
                 "jargon_examples": payload.get("jargon_examples", []),
                 "plain_english_examples": payload.get("plain_english_examples", []),
             },
@@ -1177,6 +1611,7 @@ class CapitalAllocationEvaluator:
                     "No 10-K MD&A or shareholder-letter text available for "
                     "capital-allocation analysis."
                 ),
+                outcome=OUTCOME_NO_DATA,
                 details=self._deterministic_details(
                     ctx, deterministic_concerns,
                 ),
@@ -1202,6 +1637,28 @@ class CapitalAllocationEvaluator:
 
         llm_pass = discipline >= self.LLM_DISCIPLINE_PASS_FLOOR and not flags
         passes = llm_pass and not deterministic_concerns
+
+        # Tri-state outcome:
+        # * pass: LLM clears the discipline floor with no flags AND
+        #   deterministic XBRL signals (dilution, ROIC, FCF
+        #   conversion, dividend quality) raise no concerns.
+        # * hard_fail: deterministic side flags real capital
+        #   destruction — e.g. dilution > 2%/yr, average ROIC below
+        #   reinvestment floor, dividend-quality failure. These are
+        #   structural, hard signals from the numbers, not opinions.
+        # * neutral: deterministic side is fine, but the LLM flagged
+        #   discretionary concerns (large M&A, AI capex without hurdle
+        #   rates, mechanical buybacks). For high-ROIC compounders
+        #   these usually warrant a watch label, not a fail. The
+        #   aggregate Management decision counts neutral as usable
+        #   evidence so a single LLM watch list doesn't sink the
+        #   pillar.
+        if llm_pass and not deterministic_concerns:
+            outcome: SubCheckOutcome = OUTCOME_PASS
+        elif deterministic_concerns:
+            outcome = OUTCOME_HARD_FAIL
+        else:
+            outcome = OUTCOME_NEUTRAL
 
         details = self._deterministic_details(ctx, deterministic_concerns)
         details.update({
@@ -1241,6 +1698,7 @@ class CapitalAllocationEvaluator:
             passes=passes,
             score=float(discipline),
             rationale=rationale,
+            outcome=outcome,
             details=details,
         )
 
@@ -1313,6 +1771,7 @@ class CompensationEvaluator:
             return SubCheck(
                 name="Compensation", passes=False, score=None,
                 rationale="No DEF 14A Compensation Discussion & Analysis available.",
+                outcome=OUTCOME_NO_DATA,
             )
         body = self._llm.truncate(bundle.def14a_compensation_text)
         result = self._llm.call(
@@ -1329,25 +1788,45 @@ class CompensationEvaluator:
         )
         payload = result.payload
         aligned = bool(payload.get("aligned_with_shareholders", False))
+        aligned_metrics = list(payload.get("shareholder_aligned_metrics") or [])
+        empire_metrics = list(payload.get("empire_building_metrics") or [])
+        # Tri-state outcome:
+        # * pass: LLM finds the program aligned with per-share value.
+        # * hard_fail: no aligned metrics AND empire-building metrics
+        #   dominate (the genuine "comp incentivises empire-building"
+        #   red flag).
+        # * neutral: mixed (some aligned, some empire-building) but not
+        #   obviously bad — common for large-cap programs.
+        if aligned:
+            outcome: SubCheckOutcome = OUTCOME_PASS
+        elif empire_metrics and not aligned_metrics:
+            outcome = OUTCOME_HARD_FAIL
+        else:
+            outcome = OUTCOME_NEUTRAL
         return SubCheck(
             name="Compensation",
             passes=aligned,
             score=None,
             rationale=str(payload.get("rationale", ""))[:1000],
+            outcome=outcome,
             details={
                 "metrics": payload.get("metrics", []),
-                "shareholder_aligned_metrics": payload.get(
-                    "shareholder_aligned_metrics", []
-                ),
-                "empire_building_metrics": payload.get(
-                    "empire_building_metrics", []
-                ),
+                "shareholder_aligned_metrics": aligned_metrics,
+                "empire_building_metrics": empire_metrics,
             },
         )
 
 
 class InsiderAlignmentEvaluator:
-    """Deterministic: wraps ``summarize_insider_alignment`` (no LLM call)."""
+    """Deterministic: wraps ``summarize_insider_alignment`` (no LLM call).
+
+    Maps the deterministic tri-state outcome onto the management
+    ``SubCheck`` vocabulary: large recent non-plan selling → hard_fail;
+    meaningful net open-market buying → pass; everything else → neutral.
+    The aggregate Management decision uses this directly, so absent
+    insider activity for mega-cap stock-comp executives no longer
+    silently sinks the whole pillar.
+    """
 
     def __init__(self, edgar_client: EdgarClient) -> None:
         self._edgar = edgar_client
@@ -1359,6 +1838,7 @@ class InsiderAlignmentEvaluator:
             return SubCheck(
                 name="Insider", passes=False, score=None,
                 rationale=f"No CIK for {ticker}.",
+                outcome=OUTCOME_NO_DATA,
             )
         try:
             txns = fetch_insider_history(
@@ -1370,15 +1850,22 @@ class InsiderAlignmentEvaluator:
             return SubCheck(
                 name="Insider", passes=False, score=None,
                 rationale=f"Form 4 fetch failed: {exc}",
+                outcome=OUTCOME_ERROR,
+                details={"error": True, "exception_type": type(exc).__name__},
             )
         result: InsiderAlignmentResult = summarize_insider_alignment(
             txns, as_of=as_of,
         )
+        # The data layer's outcome vocabulary is identical to the
+        # SubCheck vocabulary by design — see ``InsiderOutcome`` in
+        # ``data/insider_trades.py``.
+        outcome: SubCheckOutcome = result.outcome  # type: ignore[assignment]
         return SubCheck(
             name="Insider",
             passes=result.passes,
             score=result.net_open_market_value_usd,
             rationale=result.rationale,
+            outcome=outcome,
             details={
                 "open_market_buy_value_usd": result.open_market_buy_value_usd,
                 "open_market_sell_value_usd": result.open_market_sell_value_usd,
@@ -1405,21 +1892,41 @@ def _cache_key(
     model: str,
     thinking_budget: int,
     prompt_version: str,
+    evidence_schema_version: int = EVIDENCE_SCHEMA_VERSION,
 ) -> str:
+    """Stable cache key for one Management evaluation.
+
+    Includes ``evidence_schema_version`` so a future schema change (new
+    fields on ``SubCheck`` / ``ManagementDecision``) invalidates cached
+    LLM payloads even when the prompt text is unchanged. Without this,
+    a schema migration could read decoded sub-checks that lack the
+    fields the new aggregator relies on.
+    """
     raw = (
         f"{ticker.upper()}|FY={fiscal_year}|bundle={bundle_hash}|"
-        f"model={model}|think={thinking_budget}|prompt={prompt_version}"
+        f"model={model}|think={thinking_budget}|prompt={prompt_version}|"
+        f"evidence={evidence_schema_version}"
     )
     return hashlib.sha256(raw.encode()).hexdigest()[:24] + ".json"
 
 
 def _decode_subcheck(payload: dict[str, Any], name: str) -> SubCheck:
+    raw_outcome = payload.get("outcome")
+    outcome: SubCheckOutcome | None = (
+        raw_outcome  # type: ignore[assignment]
+        if raw_outcome in {
+            OUTCOME_PASS, OUTCOME_NEUTRAL, OUTCOME_HARD_FAIL,
+            OUTCOME_NO_DATA, OUTCOME_PARTIAL_DATA, OUTCOME_ERROR,
+        }
+        else None
+    )
     return SubCheck(
         name=name,
         passes=bool(payload.get("passes", False)),
         score=payload.get("score"),
         rationale=str(payload.get("rationale", "")),
         details=payload.get("details") or {},
+        outcome=outcome,
     )
 
 
@@ -1430,6 +1937,7 @@ def _encode_subcheck(sub: SubCheck) -> dict[str, Any]:
         "score": sub.score,
         "rationale": sub.rationale,
         "details": sub.details,
+        "outcome": sub.resolved_outcome,
     }
 
 

@@ -11,6 +11,13 @@ import pytest
 
 from value_investing_backend.agents.rule_one.llm_client import LlmCallResult, LlmClient
 from value_investing_backend.agents.rule_one.management_llm import (
+    EVIDENCE_SCHEMA_VERSION,
+    MIN_USABLE_SUBCHECKS_FOR_DECISION,
+    OUTCOME_HARD_FAIL,
+    OUTCOME_NEUTRAL,
+    OUTCOME_NO_DATA,
+    OUTCOME_PARTIAL_DATA,
+    OUTCOME_PASS,
     PROMPT_VERSION,
     BlameEvaluator,
     CapitalAllocationContext,
@@ -22,6 +29,7 @@ from value_investing_backend.agents.rule_one.management_llm import (
     InsiderAlignmentEvaluator,
     LongShortEvaluator,
     ManagementAnalyzer,
+    ManagementResult,
     SubCheck,
     _cache_key,
     _encode_subcheck,
@@ -214,20 +222,25 @@ def test_compensation_fails_with_no_def14a_text() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_insider_evaluator_fails_with_no_qualifying_buys() -> None:
-    """No transactions → no qualifying open-market buys → fail.
+def test_insider_evaluator_neutral_with_no_qualifying_buys() -> None:
+    """No transactions → no qualifying open-market buys → NEUTRAL.
 
-    Phil Town's ``skin in the game`` requires *meaningful insider
-    buying*, not the absence of selling. The evaluator now refuses to
-    pass on a $0-net result.
+    Phil Town's ``skin in the game`` is a positive signal we look for,
+    but its absence is not by itself a negative signal — that would
+    silently fail every mega-cap stock-comp executive. The evaluator
+    returns ``outcome="neutral"`` so the aggregate Management decision
+    treats it as usable evidence that is neither pass nor red flag.
+    Large recent non-plan selling still hard-fails this check (see the
+    insider_trades data-layer tests).
     """
     edgar = MagicMock()
     edgar.get_cik.return_value = 999
     edgar.list_filings.return_value = []  # no insider trades found
     sub = InsiderAlignmentEvaluator(edgar).evaluate("FAKE", date(2024, 1, 1))
     assert not sub.passes
+    assert sub.resolved_outcome == "neutral"
     assert sub.details["n_transactions"] == 0
-    assert "lack of qualifying insider buying" in sub.rationale
+    assert "NEUTRAL" in sub.rationale
 
 
 # --------------------------------------------------------------------------
@@ -456,20 +469,37 @@ def test_management_analyzer_per_check_dict_lists_all_five() -> None:
     }
 
 
-def test_management_passes_only_when_all_five_pass() -> None:
-    """Replace one sub-check with a failing payload and confirm aggregator fails."""
+def test_management_hard_fails_when_compensation_is_empire_building() -> None:
+    """A genuine hard-fail signal still fails the aggregate Management
+    decision under the tri-state outcome model.
+
+    Replaces the legacy "AND of every leg" test: the new aggregate
+    decision is ``hard_fail`` if any sub-check resolves to hard_fail,
+    regardless of other evidence. Here Compensation reports only an
+    empire-building metric (Revenue) with no shareholder-aligned
+    metric — the canonical empire-building red flag — so the aggregate
+    must hard_fail even though the other sub-checks pass.
+    """
     edgar = MagicMock()
     edgar.get_cik.return_value = 999
     edgar.list_filings.return_value = []
     llm = _smart_llm()
-    # Override compensation to fail.
+    # Override compensation to a real empire-building signal.
     original_side = llm.call.side_effect
 
     def failing_compensation(*, system_prompt, user_prompt, tool, dry_run_payload=None):
         if tool["name"] == "submit_compensation_assessment":
             return LlmCallResult(
-                payload={"metrics": ["Revenue"], "aligned_with_shareholders": False,
-                         "rationale": "no"},
+                payload={
+                    "metrics": ["Revenue"],
+                    "shareholder_aligned_metrics": [],
+                    "empire_building_metrics": ["Revenue"],
+                    "aligned_with_shareholders": False,
+                    "rationale": (
+                        "Revenue is the only metric and rewards size without "
+                        "per-share discipline."
+                    ),
+                },
                 estimated_input_tokens=1, estimated_output_tokens=1,
                 estimated_cost_usd=0.0, dry_run=False,
             )
@@ -485,7 +515,11 @@ def test_management_passes_only_when_all_five_pass() -> None:
     result = analyzer.evaluate("FAKE", as_of=date(2024, 1, 1))
     assert not result.passes
     assert not result.compensation.passes
+    assert result.compensation.resolved_outcome == "hard_fail"
     assert result.blame.passes  # other sub-checks still pass
+    decision = result.decision()
+    assert decision.outcome == "hard_fail"
+    assert "compensation" in decision.hard_failures
 
 
 def test_management_one_subcheck_exception_does_not_zero_result(tmp_path: Path) -> None:
@@ -522,12 +556,22 @@ def test_management_one_subcheck_exception_does_not_zero_result(tmp_path: Path) 
     assert result.clarity.passes
     assert result.insider.passes
     # Compensation degraded gracefully — exists, fails, has the exception
-    # message in its rationale.
+    # message in its rationale, and carries the new ``error`` outcome so
+    # the aggregate decision can treat it as missing evidence rather than
+    # a hard fail.
     assert not result.compensation.passes
+    assert result.compensation.resolved_outcome == "error"
     assert "no tool_use" in result.compensation.rationale
     assert result.compensation.details.get("error") is True
-    # Aggregate still fails (because compensation is required for the AND).
-    assert not result.passes
+    # Aggregate decision treats operational errors as missing evidence:
+    # the other 5 sub-checks still produced usable signal (well above the
+    # minimum evidence threshold), so the Management aggregate does not
+    # collapse to fail just because one sub-check raised. The error is
+    # surfaced in the decision rationale and stays visible per sub-check.
+    decision = result.decision()
+    assert "compensation" in decision.error_subchecks
+    assert decision.outcome in {"pass", "neutral"}
+    assert decision.usable_evidence_count >= 3
 
 
 # --------------------------------------------------------------------------
@@ -685,3 +729,451 @@ def test_pre_coverage_cache_backfills_coverage_from_bundle(tmp_path: Path) -> No
     assert result.coverage.form4_n_transactions == 7
     # No new LLM calls — cache served everything.
     llm.call.assert_not_called()
+
+
+# --------------------------------------------------------------------------
+# Regression tests for the v3 prompt + v2 evidence schema
+# --------------------------------------------------------------------------
+#
+# Each test here pins a behaviour from the management-scoring fix plan
+# so future prompt or threshold changes can't silently regress the new
+# semantics. Group covers:
+#
+#   * tri-state outcomes per sub-check (LongShort mixed, Insider zero
+#     buys / large sells, Compensation empire-building);
+#   * source-quality plumbing (Item 1 fallback / annual_report archive
+#     stay marked as fallback rather than promoting to a real letter);
+#   * aggregate ManagementDecision (missing-data → no_data, neutral
+#     legs do not silently flip the pillar to fail);
+#   * cache invalidation on PROMPT_VERSION / EVIDENCE_SCHEMA_VERSION
+#     bumps.
+
+
+class TestRegressionTriStateOutcomes:
+    """Sub-check outcomes must remain a tri-state (pass / neutral / hard_fail)."""
+
+    def test_long_short_mixed_is_neutral(self) -> None:
+        llm = _make_llm({
+            "short_term_mentions": 6, "long_term_mentions": 5,
+            "dominant_orientation": "mixed", "rationale": "balanced",
+        })
+        sub = LongShortEvaluator(llm).evaluate(_bundle(transcripts=[_transcript()]))
+        assert sub.resolved_outcome == OUTCOME_NEUTRAL
+        assert not sub.passes
+
+    def test_long_short_short_is_hard_fail(self) -> None:
+        llm = _make_llm({
+            "short_term_mentions": 15, "long_term_mentions": 2,
+            "dominant_orientation": "short",
+            "rationale": "obsessed with quarterly prints",
+        })
+        sub = LongShortEvaluator(llm).evaluate(_bundle(transcripts=[_transcript()]))
+        assert sub.resolved_outcome == OUTCOME_HARD_FAIL
+        assert not sub.passes
+
+    def test_long_short_long_is_pass(self) -> None:
+        llm = _make_llm({
+            "short_term_mentions": 2, "long_term_mentions": 12,
+            "dominant_orientation": "long", "rationale": "decade-long strategy",
+        })
+        sub = LongShortEvaluator(llm).evaluate(_bundle(transcripts=[_transcript()]))
+        assert sub.resolved_outcome == OUTCOME_PASS
+        assert sub.passes
+
+    def test_compensation_empire_building_is_hard_fail(self) -> None:
+        llm = _make_llm({
+            "metrics": ["Revenue"],
+            "shareholder_aligned_metrics": [],
+            "empire_building_metrics": ["Revenue"],
+            "aligned_with_shareholders": False,
+            "rationale": "size-based comp",
+        })
+        sub = CompensationEvaluator(llm).evaluate(_bundle())
+        assert sub.resolved_outcome == OUTCOME_HARD_FAIL
+
+    def test_compensation_mixed_is_neutral(self) -> None:
+        llm = _make_llm({
+            "metrics": ["TSR", "Revenue"],
+            "shareholder_aligned_metrics": ["TSR"],
+            "empire_building_metrics": ["Revenue"],
+            "aligned_with_shareholders": False,
+            "rationale": "mixed",
+        })
+        sub = CompensationEvaluator(llm).evaluate(_bundle())
+        assert sub.resolved_outcome == OUTCOME_NEUTRAL
+
+
+class TestRegressionSourceQuality:
+    """Item 1 fallback / annual-report container must stay marked as fallback."""
+
+    def test_clarity_on_item1_fallback_is_partial_data(self) -> None:
+        """Clarity scored from the Item 1 fallback never promotes to a clean
+        ``pass`` outcome — that would silently treat regulatory boilerplate
+        as if it were a CEO-to-shareholder letter."""
+        llm = _make_llm({
+            "clarity_score": 9,
+            "plain_english_examples": ["clear sentence"],
+            "rationale": "intelligible",
+        })
+        bundle = DocumentBundle(
+            ticker="FAKE", as_of=date(2024, 1, 1), fiscal_year=2023,
+            accession_10k="10K-1", accession_def14a="14A-1",
+            mda_text="",  # force the fallback branch
+            def14a_compensation_text="", def14a_letter_text="",
+            shareholder_letter_text="10-K Item 1 business " * 200,
+            shareholder_letter_is_fallback=True,
+        )
+        sub = ClarityEvaluator(llm).evaluate(bundle)
+        assert sub.resolved_outcome == "partial_data"
+        assert not sub.passes
+
+    def test_archive_annual_report_marked_as_letter_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An archived ``annual_report`` filling the shareholder-letter slot
+        must set ``shareholder_letter_is_fallback`` so LongShort / Clarity
+        receive the same Item-1-style downgrade."""
+
+        class FakeArchive:
+            name = "fake_archive"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get_documents(self, ticker, as_of, *, doc_type=None, limit=20):
+                if doc_type in (None, "annual_report"):
+                    return [
+                        ArchivedManagementDocument(
+                            ticker=ticker, as_of=as_of,
+                            doc_type="annual_report",
+                            text="Annual report container " * 300,
+                            source_url="https://example.com/ar.pdf",
+                            storage_path="FAKE/annual_report/doc.txt",
+                            content_hash="deadbeef" * 8,
+                            provider="fake",
+                            published_date=date(2023, 12, 31),
+                            fiscal_year=2023,
+                        )
+                    ]
+                return []
+
+        edgar = MagicMock()
+        edgar.get_cik.return_value = 999
+        edgar.list_filings.return_value = []
+        bundler = DocumentBundler(
+            edgar_client=edgar,
+            transcript_provider=MagicMock(get_transcripts=MagicMock(return_value=[])),
+            archive_provider=ArchiveBackedManagementProvider(FakeArchive()),
+        )
+        bundle = bundler.build("FAKE", date(2024, 1, 1))
+        assert bundle.shareholder_letter_text
+        assert bundle.shareholder_letter_is_fallback is True
+
+
+class TestRegressionAggregateDecision:
+    """The aggregate Management decision must obey the contract."""
+
+    def _result(
+        self,
+        *,
+        blame: tuple[bool, str],
+        long_short: tuple[bool, str],
+        clarity: tuple[bool, str],
+        compensation: tuple[bool, str],
+        insider: tuple[bool, str],
+        capital_allocation: tuple[bool, str] | None = None,
+    ) -> ManagementResult:
+        def _sc(name: str, pair: tuple[bool, str]) -> SubCheck:
+            passes, outcome = pair
+            return SubCheck(
+                name=name, passes=passes, score=None, rationale=name,
+                outcome=outcome,  # type: ignore[arg-type]
+            )
+
+        cap = (
+            _sc("CapitalAllocation", capital_allocation)
+            if capital_allocation is not None
+            else None
+        )
+        return ManagementResult(
+            ticker="FAKE", as_of=date(2024, 1, 1), fiscal_year=2023,
+            bundle_hash="", model="m", cached=False,
+            blame=_sc("Blame", blame),
+            long_short=_sc("LongShort", long_short),
+            clarity=_sc("Clarity", clarity),
+            compensation=_sc("Compensation", compensation),
+            insider=_sc("Insider", insider),
+            capital_allocation=cap,
+        )
+
+    def test_all_missing_data_is_no_data_not_pass(self) -> None:
+        """All sub-checks reporting no_data must produce a ``no_data``
+        aggregate decision, never a silent ``pass``."""
+        result = self._result(
+            blame=(False, OUTCOME_NO_DATA),
+            long_short=(False, OUTCOME_NO_DATA),
+            clarity=(False, OUTCOME_NO_DATA),
+            compensation=(False, OUTCOME_NO_DATA),
+            insider=(False, OUTCOME_NO_DATA),
+        )
+        decision = result.decision()
+        assert decision.outcome == "no_data"
+        assert not result.passes
+        assert decision.usable_evidence_count == 0
+
+    def test_neutral_only_is_neutral_not_fail(self) -> None:
+        """Five neutral sub-checks (no hard failures) must NOT collapse
+        to a clean fail under the new aggregate — the legacy AND gate
+        would have done that."""
+        result = self._result(
+            blame=(False, OUTCOME_NEUTRAL),
+            long_short=(False, OUTCOME_NEUTRAL),
+            clarity=(False, OUTCOME_NEUTRAL),
+            compensation=(False, OUTCOME_NEUTRAL),
+            insider=(False, OUTCOME_NEUTRAL),
+        )
+        decision = result.decision()
+        assert decision.outcome == "neutral"
+        assert not result.passes
+        assert decision.usable_evidence_count >= MIN_USABLE_SUBCHECKS_FOR_DECISION
+
+    def test_mega_cap_pass_with_clean_majority_and_some_neutral(self) -> None:
+        """4 clean passes + 2 neutral (LongShort mixed, Insider no buys)
+        is the canonical mega-cap shape and must aggregate to PASS."""
+        result = self._result(
+            blame=(True, OUTCOME_PASS),
+            long_short=(False, OUTCOME_NEUTRAL),
+            clarity=(True, OUTCOME_PASS),
+            compensation=(True, OUTCOME_PASS),
+            insider=(False, OUTCOME_NEUTRAL),
+            capital_allocation=(True, OUTCOME_PASS),
+        )
+        decision = result.decision()
+        assert decision.outcome == "pass"
+        assert result.passes
+        assert "long_short" in decision.neutral_subchecks
+        assert "insider" in decision.neutral_subchecks
+
+    def test_single_hard_fail_fails_aggregate(self) -> None:
+        """A real red flag still hard-fails the Management pillar even
+        when every other sub-check passes."""
+        result = self._result(
+            blame=(True, OUTCOME_PASS),
+            long_short=(True, OUTCOME_PASS),
+            clarity=(True, OUTCOME_PASS),
+            compensation=(False, OUTCOME_HARD_FAIL),
+            insider=(True, OUTCOME_PASS),
+        )
+        decision = result.decision()
+        assert decision.outcome == "hard_fail"
+        assert not result.passes
+        assert "compensation" in decision.hard_failures
+
+
+class TestRegressionCacheInvalidation:
+    """``PROMPT_VERSION`` / ``EVIDENCE_SCHEMA_VERSION`` bumps must invalidate cache."""
+
+    def test_cache_key_changes_with_prompt_version(self) -> None:
+        a = _cache_key(
+            ticker="FAKE", fiscal_year=2023, bundle_hash="abc",
+            model="m", thinking_budget=32_000, prompt_version="v3",
+        )
+        b = _cache_key(
+            ticker="FAKE", fiscal_year=2023, bundle_hash="abc",
+            model="m", thinking_budget=32_000, prompt_version="v4",
+        )
+        assert a != b
+
+    def test_cache_key_changes_with_evidence_schema_version(self) -> None:
+        a = _cache_key(
+            ticker="FAKE", fiscal_year=2023, bundle_hash="abc",
+            model="m", thinking_budget=32_000, prompt_version="v3",
+            evidence_schema_version=2,
+        )
+        b = _cache_key(
+            ticker="FAKE", fiscal_year=2023, bundle_hash="abc",
+            model="m", thinking_budget=32_000, prompt_version="v3",
+            evidence_schema_version=3,
+        )
+        assert a != b
+
+    def test_evidence_schema_version_is_set(self) -> None:
+        """Sanity check: schema version is a positive integer the rest
+        of the dashboard pins on."""
+        assert isinstance(EVIDENCE_SCHEMA_VERSION, int)
+        assert EVIDENCE_SCHEMA_VERSION >= 2
+
+
+class TestRegressionAggregateNegativeControls:
+    """Negative controls — verify the new aggregate is NOT too permissive.
+
+    The aggregate rule (3 usable, 2 clean passes, no hard failures)
+    deliberately tolerates neutral and partial_data evidence for mega
+    caps. These tests pin the failure modes so a future "let everything
+    pass" overcorrection cannot creep in:
+
+    * any hard_fail still fails the pillar, regardless of how many
+      neutral / clean-pass legs sit around it;
+    * partial-data-only evidence does not pass (it lacks the required
+      clean-pass count);
+    * just below the usable-evidence floor degrades to no_data;
+    * just below the clean-pass floor degrades to neutral.
+    """
+
+    def _result(
+        self,
+        *,
+        blame: tuple[bool, str],
+        long_short: tuple[bool, str],
+        clarity: tuple[bool, str],
+        compensation: tuple[bool, str],
+        insider: tuple[bool, str],
+        capital_allocation: tuple[bool, str] | None = None,
+    ) -> ManagementResult:
+        def _sc(name: str, pair: tuple[bool, str]) -> SubCheck:
+            passes, outcome = pair
+            return SubCheck(
+                name=name, passes=passes, score=None, rationale=name,
+                outcome=outcome,  # type: ignore[arg-type]
+            )
+
+        cap = (
+            _sc("CapitalAllocation", capital_allocation)
+            if capital_allocation is not None
+            else None
+        )
+        return ManagementResult(
+            ticker="FAKE", as_of=date(2024, 1, 1), fiscal_year=2023,
+            bundle_hash="", model="m", cached=False,
+            blame=_sc("Blame", blame),
+            long_short=_sc("LongShort", long_short),
+            clarity=_sc("Clarity", clarity),
+            compensation=_sc("Compensation", compensation),
+            insider=_sc("Insider", insider),
+            capital_allocation=cap,
+        )
+
+    def test_hard_fail_among_otherwise_passing_legs_still_fails(self) -> None:
+        """One real red flag is enough — the four-clean-passes + one
+        hard_fail shape (e.g. clear blame deflection at an otherwise
+        well-managed company) must still fail the pillar."""
+        result = self._result(
+            blame=(False, OUTCOME_HARD_FAIL),
+            long_short=(True, OUTCOME_PASS),
+            clarity=(True, OUTCOME_PASS),
+            compensation=(True, OUTCOME_PASS),
+            insider=(True, OUTCOME_PASS),
+            capital_allocation=(True, OUTCOME_PASS),
+        )
+        decision = result.decision()
+        assert decision.outcome == "hard_fail"
+        assert not result.passes
+        assert decision.hard_failures == ("blame",)
+
+    def test_hard_fail_among_otherwise_neutral_legs_still_fails(self) -> None:
+        """Hard fail wins even when surrounded by neutral evidence —
+        the mega-cap "everything is mixed except this one real flag"
+        case."""
+        result = self._result(
+            blame=(False, OUTCOME_NEUTRAL),
+            long_short=(False, OUTCOME_NEUTRAL),
+            clarity=(False, OUTCOME_NEUTRAL),
+            compensation=(False, OUTCOME_HARD_FAIL),
+            insider=(False, OUTCOME_NEUTRAL),
+            capital_allocation=(False, OUTCOME_NEUTRAL),
+        )
+        decision = result.decision()
+        assert decision.outcome == "hard_fail"
+        assert not result.passes
+        assert "compensation" in decision.hard_failures
+
+    def test_partial_data_only_does_not_pass(self) -> None:
+        """All-partial-data evidence cannot satisfy the
+        ``>= 2 clean passes`` requirement — the aggregate falls back to
+        neutral, never to a clean pass."""
+        result = self._result(
+            blame=(False, OUTCOME_PARTIAL_DATA),
+            long_short=(False, OUTCOME_PARTIAL_DATA),
+            clarity=(False, OUTCOME_PARTIAL_DATA),
+            compensation=(False, OUTCOME_PARTIAL_DATA),
+            insider=(False, OUTCOME_PARTIAL_DATA),
+            capital_allocation=(False, OUTCOME_PARTIAL_DATA),
+        )
+        decision = result.decision()
+        assert decision.outcome == "neutral"
+        assert not result.passes
+        assert decision.clean_passes == ()
+
+    def test_two_clean_passes_below_usable_floor_is_no_data(self) -> None:
+        """Only two usable sub-checks (both clean passes) is below the
+        minimum-evidence floor — the aggregate must NOT promote this to
+        a clean pass even though everything evaluated is positive."""
+        result = self._result(
+            blame=(True, OUTCOME_PASS),
+            long_short=(True, OUTCOME_PASS),
+            clarity=(False, OUTCOME_NO_DATA),
+            compensation=(False, OUTCOME_NO_DATA),
+            insider=(False, OUTCOME_NO_DATA),
+            capital_allocation=(False, OUTCOME_NO_DATA),
+        )
+        decision = result.decision()
+        # Two usable sub-checks (< MIN_USABLE_SUBCHECKS_FOR_DECISION = 3).
+        assert decision.usable_evidence_count == 2
+        assert decision.outcome == "no_data"
+        assert not result.passes
+
+    def test_one_clean_pass_plus_neutrals_is_neutral_not_pass(self) -> None:
+        """Below the clean-pass floor (only 1 clean pass) the aggregate
+        degrades to neutral even when the usable-evidence floor is
+        cleared — the pillar is not green until the company has earned
+        at least the minimum number of positive sub-checks."""
+        result = self._result(
+            blame=(True, OUTCOME_PASS),
+            long_short=(False, OUTCOME_NEUTRAL),
+            clarity=(False, OUTCOME_NEUTRAL),
+            compensation=(False, OUTCOME_NEUTRAL),
+            insider=(False, OUTCOME_NEUTRAL),
+            capital_allocation=(False, OUTCOME_NEUTRAL),
+        )
+        decision = result.decision()
+        assert decision.usable_evidence_count == 6
+        assert len(decision.clean_passes) == 1
+        assert decision.outcome == "neutral"
+        assert not result.passes
+
+    def test_clean_passes_outnumbered_by_partial_is_neutral(self) -> None:
+        """When partial_data dominates over clean passes, the pillar
+        does not get the green light — the dashboard should warn that
+        the apparent passes were graded on degraded sources."""
+        result = self._result(
+            blame=(True, OUTCOME_PASS),
+            long_short=(True, OUTCOME_PASS),
+            clarity=(False, OUTCOME_PARTIAL_DATA),
+            compensation=(False, OUTCOME_PARTIAL_DATA),
+            insider=(False, OUTCOME_PARTIAL_DATA),
+            capital_allocation=(False, OUTCOME_PARTIAL_DATA),
+        )
+        decision = result.decision()
+        # 6 usable, 2 clean passes, but 4 partial — partial outnumbers
+        # clean so the aggregate downgrades to neutral.
+        assert decision.outcome == "neutral"
+        assert not result.passes
+
+    def test_three_clean_passes_with_one_neutral_does_pass(self) -> None:
+        """Positive control for the boundary: exactly at the minimum
+        evidence + clean-pass thresholds the aggregate does pass. Acts
+        as a paired test with the negative controls above so the
+        boundary stays explicit."""
+        result = self._result(
+            blame=(True, OUTCOME_PASS),
+            long_short=(True, OUTCOME_PASS),
+            clarity=(True, OUTCOME_PASS),
+            compensation=(False, OUTCOME_NEUTRAL),
+            insider=(False, OUTCOME_NO_DATA),
+            capital_allocation=(False, OUTCOME_NO_DATA),
+        )
+        decision = result.decision()
+        assert decision.usable_evidence_count == 4
+        assert len(decision.clean_passes) == 3
+        assert decision.outcome == "pass"
+        assert result.passes

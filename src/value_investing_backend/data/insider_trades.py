@@ -64,6 +64,13 @@ class InsiderTransaction:
     is_10b5_1_plan: bool
 
 
+InsiderOutcome = str
+"""One of ``"pass" | "neutral" | "hard_fail"`` — see
+``summarize_insider_alignment`` for the full rule. Stored as a plain str
+to avoid a cross-module ``Literal`` import; the management evaluator
+maps this directly to ``SubCheck.outcome``."""
+
+
 @dataclass(frozen=True)
 class InsiderAlignmentResult:
     """Aggregated insider-alignment signal computed over a lookback window."""
@@ -79,6 +86,21 @@ class InsiderAlignmentResult:
     has_large_recent_sells: bool  # > $1M of non-plan sells in last 90 days
     by_role_net_usd: dict[str, float]
     passes: bool
+    """Legacy boolean: ``outcome == "pass"``. Preserved so callers
+    that haven't migrated to the new outcome vocabulary still
+    function — the new field is ``outcome``."""
+    outcome: InsiderOutcome
+    """Tri-state outcome:
+
+    * ``"pass"``      — meaningful net open-market buying (>= the
+      minimum buy threshold) and no large recent non-plan selling. The
+      "skin in the game" signal Phil Town wants.
+    * ``"hard_fail"`` — large recent non-plan selling. A genuine
+      negative alignment signal regardless of buying activity.
+    * ``"neutral"``   — neither: typically zero open-market buying with
+      no large sells. For mega-cap stock-comp-paid executives this is
+      the norm and should not be treated as a red flag.
+    """
     rationale: str
 
 
@@ -280,14 +302,17 @@ def fetch_insider_history(
     return out
 
 
-# Minimum positive open-market buying we require to call the alignment
-# check a clean PASS. Below this threshold "$0 net" looks like a pass on
-# paper but Phil Town's "skin in the game" criterion isn't satisfied —
-# absence of selling is not a positive signal. The threshold is set in
-# notional dollar terms because that's how Phil Town frames it ("are
-# insiders putting their own money in?"); $25k filters out token grants
-# net of taxes while still accepting genuine personal purchases.
+# Minimum net open-market buying we require to call the alignment
+# check a clean PASS. Genuine "skin in the game" purchases for
+# Phil-Town-style owner-operators look like personal cheques sized in
+# the tens of thousands or more; $25k filters out token grants net of
+# taxes while still accepting real personal purchases.
 INSIDER_MIN_NET_BUY_USD: float = 25_000.0
+
+# Outcome strings — kept in sync with management_llm SubCheckOutcome.
+INSIDER_OUTCOME_PASS = "pass"
+INSIDER_OUTCOME_NEUTRAL = "neutral"
+INSIDER_OUTCOME_HARD_FAIL = "hard_fail"
 
 
 def summarize_insider_alignment(
@@ -303,25 +328,35 @@ def summarize_insider_alignment(
 ) -> InsiderAlignmentResult:
     """Aggregate Form 4 transactions into a Phil-Town-style alignment signal.
 
-    Pass criteria (all must hold):
+    The outcome rule is tri-state, because "no open-market buying" is
+    only a red flag for owner-operators — for stock-compensation-paid
+    mega-cap executives, the absence of personal purchases is the norm
+    and should not silently fail the Management pillar.
 
-        * net open-market buying (excluding plan sells, tax withholding,
-          gifts, grants, derivative exercises) is **strictly positive**
-          and at least ``min_net_buy_usd`` in notional terms, AND
-        * no large coordinated insider sells in the past 90 days (more
-          than ``large_recent_sell_threshold_usd`` of non-plan sells).
-
-    The strict ``net >= min_net_buy_usd`` requirement closes the
-    previous "no insider activity → $0 net → PASS" loophole: Phil Town
-    treats *meaningful insider buying* as a positive signal, not the
-    mere absence of selling. When no qualifying activity is observed in
-    the lookback window the check now fails with rationale "no
-    qualifying open-market buys" — and the management evidence layer
-    surfaces that as a real signal failure rather than a clean pass.
+    * ``"pass"``      — net open-market buying (excluding plan sells,
+      tax withholding, gifts, grants, derivative exercises) is at
+      least ``min_net_buy_usd`` in notional terms, AND there is no
+      large recent non-plan selling. This is the "skin in the game"
+      signal.
+    * ``"hard_fail"`` — large recent non-plan selling
+      (> ``large_recent_sell_threshold_usd`` in the last
+      ``large_recent_sell_window_days`` days). A genuine negative
+      alignment signal regardless of how much buying happened.
+    * ``"neutral"``   — neither pass nor hard fail. Most often: zero
+      qualifying open-market buying with no large non-plan sells.
+      Mega-cap executives who hold hundreds of millions in vested
+      stock and never write personal cheques sit here. The aggregate
+      Management decision treats this as usable evidence that is
+      neither positive nor negative.
 
     A ``coordinated_buy`` flag is also returned: 3+ distinct insiders
     making open-market buys within a 60-day window — Phil Town's
-    "massive green flag".
+    "massive green flag" — and surfaces as ``pass`` whenever the buy
+    threshold is met.
+
+    The legacy ``passes`` boolean is preserved (``outcome == "pass"``)
+    so callers that haven't migrated keep working; the aggregate
+    Management gate now uses ``outcome`` directly.
     """
     lookback_start = as_of - timedelta(days=lookback_months * 30)
     in_window = [
@@ -372,15 +407,44 @@ def summarize_insider_alignment(
     )
     has_large_recent = recent_sells > large_recent_sell_threshold_usd
 
-    passes = net >= min_net_buy_usd and not has_large_recent
+    if has_large_recent:
+        outcome = INSIDER_OUTCOME_HARD_FAIL
+    elif net >= min_net_buy_usd:
+        outcome = INSIDER_OUTCOME_PASS
+    else:
+        outcome = INSIDER_OUTCOME_NEUTRAL
+    passes = outcome == INSIDER_OUTCOME_PASS
+
     if not in_window:
         rationale = (
             f"No Form 4 transactions in window "
-            f"{lookback_start.isoformat()}..{as_of.isoformat()}; "
-            "absence of selling is not a positive signal — "
-            "alignment check fails for lack of qualifying insider buying."
+            f"{lookback_start.isoformat()}..{as_of.isoformat()}. "
+            "Treated as NEUTRAL: absence of activity is not a positive "
+            '"skin in the game" signal, but it is also not a red flag '
+            "for stock-comp-paid executives who already hold large "
+            "vested positions. Large recent non-plan selling would "
+            "still hard-fail this check."
         )
     else:
+        outcome_blurb = {
+            INSIDER_OUTCOME_PASS: (
+                "PASS: net open-market buying clears the "
+                f"${min_net_buy_usd/1e3:,.0f}k threshold and no large "
+                "recent non-plan selling."
+            ),
+            INSIDER_OUTCOME_HARD_FAIL: (
+                "HARD FAIL: large recent non-plan selling "
+                f"(${recent_sells/1e3:,.0f}k in last "
+                f"{large_recent_sell_window_days}d > "
+                f"${large_recent_sell_threshold_usd/1e3:,.0f}k threshold)."
+            ),
+            INSIDER_OUTCOME_NEUTRAL: (
+                "NEUTRAL: no qualifying open-market buying and no "
+                "large recent non-plan selling. Phil Town's "
+                '"meaningful buying" signal is absent, but there is no '
+                "negative alignment signal either."
+            ),
+        }[outcome]
         rationale = (
             f"Window {lookback_start.isoformat()}..{as_of.isoformat()}: "
             f"buys ${buy_value/1e3:,.0f}k, sells ${sell_value/1e3:,.0f}k "
@@ -388,7 +452,8 @@ def summarize_insider_alignment(
             f"(threshold ≥ ${min_net_buy_usd/1e3:,.0f}k). "
             f"Coordinated-buy={coordinated_buy} ({coordinated_count} insiders); "
             f"large recent sells (last {large_recent_sell_window_days}d)="
-            f"{has_large_recent} (${recent_sells/1e3:,.0f}k)."
+            f"{has_large_recent} (${recent_sells/1e3:,.0f}k). "
+            f"{outcome_blurb}"
         )
 
     return InsiderAlignmentResult(
@@ -403,5 +468,6 @@ def summarize_insider_alignment(
         has_large_recent_sells=has_large_recent,
         by_role_net_usd=by_role_net,
         passes=passes,
+        outcome=outcome,
         rationale=rationale,
     )

@@ -43,18 +43,80 @@ from value_investing_backend.agents.rule_one.big_five import (
 )
 from value_investing_backend.agents.rule_one.four_ms_llm import FourMsResult
 from value_investing_backend.agents.rule_one.management_llm import (
+    EVIDENCE_SCHEMA_VERSION,
+    OUTCOME_ERROR,
+    OUTCOME_HARD_FAIL,
+    OUTCOME_NEUTRAL,
+    OUTCOME_NO_DATA,
+    OUTCOME_PARTIAL_DATA,
+    OUTCOME_PASS,
+    SHAREHOLDER_LETTER_FROM_ARCHIVE,
+    SHAREHOLDER_LETTER_FROM_BUSINESS_DESCRIPTION,
+    SHAREHOLDER_LETTER_FROM_DEF14A,
     ManagementResult,
     SourceCoverage,
     SubCheck,
 )
 
+# Bumped to 2 when management evidence grew the explicit ``outcome``
+# field per sub-check and the ``decision`` aggregate block. Big 5
+# evidence still uses the legacy schema_version=1 shape; the dashboard
+# tolerates a mixed-version blob during the rollout.
 SCHEMA_VERSION = 1
 
 STATUS_PASS = "pass"
 STATUS_FAIL = "fail"
 STATUS_NO_DATA = "no_data"
 STATUS_PARTIAL_DATA = "partial_data"
+STATUS_NEUTRAL = "neutral"
 STATUS_ERROR = "error"
+
+# The shareholder_letter coverage slot carries a ``from`` tag whose
+# value identifies the source. Only def14a and archive-backed
+# shareholder_letter docs are treated as the "real" letter material;
+# everything else (10-K Item 1 fallback, annual-report container
+# without an extracted letter section) is degraded for LongShort and
+# Clarity even though the slot reports ``available=true``.
+_REAL_SHAREHOLDER_LETTER_PREFIXES: tuple[str, ...] = (
+    SHAREHOLDER_LETTER_FROM_DEF14A,
+    f"{SHAREHOLDER_LETTER_FROM_ARCHIVE}:shareholder_letter",
+    f"{SHAREHOLDER_LETTER_FROM_ARCHIVE}:proxy_letter",
+)
+_DEGRADED_SHAREHOLDER_LETTER_PREFIXES: tuple[str, ...] = (
+    SHAREHOLDER_LETTER_FROM_BUSINESS_DESCRIPTION,
+    "10-k_item1_fallback",
+    f"{SHAREHOLDER_LETTER_FROM_ARCHIVE}:annual_report",
+    f"{SHAREHOLDER_LETTER_FROM_ARCHIVE}:ten_k_item1_fallback",
+    f"{SHAREHOLDER_LETTER_FROM_ARCHIVE}:ir_material",
+)
+
+
+def _shareholder_letter_quality(coverage: dict[str, Any] | None) -> str:
+    """Return ``"real" | "degraded" | "missing"`` for the letter slot.
+
+    "Real" means a CEO-style shareholder letter (def14a proxy letter or
+    archive-validated shareholder_letter / proxy_letter doc). "Degraded"
+    means the slot is filled, but the underlying source is Item 1
+    Business Description or a broad annual-report container without an
+    extracted letter section; LongShort and Clarity should treat that
+    as ``partial_data``. "Missing" means the slot is empty.
+    """
+    if not coverage:
+        return "missing"
+    letter = coverage.get("shareholder_letter")
+    if not isinstance(letter, dict) or not letter.get("available"):
+        return "missing"
+    source = (letter.get("from") or "").lower()
+    if not source:
+        # Slot reports ``available`` but the bundler didn't tag the
+        # source — treat as degraded so the dashboard doesn't silently
+        # upgrade unknown provenance to a clean letter signal.
+        return "degraded"
+    if any(source.startswith(p.lower()) for p in _REAL_SHAREHOLDER_LETTER_PREFIXES):
+        return "real"
+    if any(source.startswith(p.lower()) for p in _DEGRADED_SHAREHOLDER_LETTER_PREFIXES):
+        return "degraded"
+    return "degraded"
 
 
 # --------------------------------------------------------------------------
@@ -276,6 +338,12 @@ def build_big_five_evidence(big_five: BigFiveResult | None) -> dict[str, Any]:
 # any one source in ``required_sources`` is enough to compute the check;
 # missing the rest only downgrades to ``partial_data``. Otherwise, every
 # listed source must be present or the check is ``no_data``.
+#
+# ``shareholder_letter_must_be_real`` means the sub-check is downgraded
+# to ``partial_data`` when the shareholder-letter slot is filled by
+# Item 1 / annual-report-container fallback rather than a real letter.
+# This stops broad regulatory disclosure text from being scored as if
+# it were a Buffett/Bezos owner letter.
 _SUBCHECK_SPECS: dict[str, dict[str, Any]] = {
     "blame": {
         "label": "Blame test",
@@ -286,11 +354,13 @@ _SUBCHECK_SPECS: dict[str, dict[str, Any]] = {
         "label": "Long-term focus",
         "required_sources": ["transcripts", "shareholder_letter"],
         "any_of_required": True,
+        "shareholder_letter_must_be_real": True,
     },
     "clarity": {
         "label": "Plain-English clarity",
         "required_sources": ["shareholder_letter", "mda"],
         "any_of_required": True,
+        "shareholder_letter_must_be_real": True,
     },
     "compensation": {
         "label": "Compensation alignment",
@@ -306,11 +376,34 @@ _SUBCHECK_SPECS: dict[str, dict[str, Any]] = {
         "label": "Capital allocation",
         # The check needs at least one qualitative source (MD&A or
         # shareholder letter) to evaluate the LLM side; ``any_of`` keeps
-        # the gate workable when one source is missing.
+        # the gate workable when one source is missing. MD&A counts as
+        # primary signal here, so the Item 1 fallback is acceptable.
         "required_sources": ["mda", "shareholder_letter"],
         "any_of_required": True,
     },
 }
+
+
+def _status_from_outcome(outcome: str) -> str:
+    """Map a ``SubCheckOutcome`` to the dashboard's status vocabulary.
+
+    Sub-check ``outcome`` is the source of truth on new runs. Older
+    cached results without an explicit outcome fall through to the
+    legacy pass/fail derivation in ``_derive_subcheck_status``.
+    """
+    if outcome == OUTCOME_PASS:
+        return STATUS_PASS
+    if outcome == OUTCOME_HARD_FAIL:
+        return STATUS_FAIL
+    if outcome == OUTCOME_NEUTRAL:
+        return STATUS_NEUTRAL
+    if outcome == OUTCOME_PARTIAL_DATA:
+        return STATUS_PARTIAL_DATA
+    if outcome == OUTCOME_NO_DATA:
+        return STATUS_NO_DATA
+    if outcome == OUTCOME_ERROR:
+        return STATUS_ERROR
+    return STATUS_NO_DATA
 
 
 def _coverage_lookup(
@@ -329,33 +422,75 @@ def _derive_subcheck_status(
     sub: SubCheck,
     spec: dict[str, Any],
     coverage: dict[str, Any] | None,
-) -> tuple[str, list[str]]:
-    """Return ``(status, missing_sources)`` for a Management sub-check.
+) -> tuple[str, list[str], list[str]]:
+    """Return ``(status, missing_sources, degraded_sources)`` for a sub-check.
+
+    Resolution order:
+
+    1. Operational ``error`` outcome (or legacy ``error`` flag in
+       details) → ``STATUS_ERROR``.
+    2. Explicit ``outcome`` field on the SubCheck wins when set: it is
+       the source of truth on new runs, and ``no_data`` / ``hard_fail``
+       beat any source-coverage-derived status.
+    3. Source coverage gates: if a required source is missing the
+       status degrades to ``no_data``; if only a degraded source is
+       available (e.g. Item 1 fallback for the shareholder letter slot)
+       the status degrades to ``partial_data`` even when the underlying
+       LLM signal would have passed.
+    4. Fall back to pass/fail from the legacy ``passes`` boolean.
 
     Coverage is optional so this stays back-compatible with cached
-    Management results that pre-date the ``SourceCoverage`` field. Without
-    coverage we can only fall back to pass/fail (or ``error`` when the
-    sub-check exception flag is set).
+    Management results that pre-date the ``SourceCoverage`` field.
     """
-    if sub.details.get("error"):
-        return STATUS_ERROR, []
+    legacy_error = bool(sub.details.get("error"))
+    explicit_outcome = sub.outcome
 
-    if coverage is None:
-        return STATUS_PASS if sub.passes else STATUS_FAIL, []
+    if legacy_error or explicit_outcome == OUTCOME_ERROR:
+        return STATUS_ERROR, [], []
 
     required = spec.get("required_sources", []) or []
+    if coverage is None:
+        if explicit_outcome is not None:
+            return _status_from_outcome(explicit_outcome), [], []
+        return (STATUS_PASS if sub.passes else STATUS_FAIL), [], []
+
     available = [s for s in required if _coverage_lookup(coverage, s)]
     missing = [s for s in required if not _coverage_lookup(coverage, s)]
 
-    if spec.get("any_of_required", False):
-        if not available:
-            return STATUS_NO_DATA, missing
-        if missing:
-            return STATUS_PARTIAL_DATA, missing
-    elif missing:
-        return STATUS_NO_DATA, missing
+    degraded: list[str] = []
+    letter_quality = _shareholder_letter_quality(coverage)
+    if (
+        spec.get("shareholder_letter_must_be_real", False)
+        and "shareholder_letter" in available
+        and letter_quality == "degraded"
+    ):
+        degraded.append("shareholder_letter")
 
-    return (STATUS_PASS if sub.passes else STATUS_FAIL), missing
+    if spec.get("any_of_required", False):
+        # Sources that count as "really available" — degraded sources
+        # are present but downgraded. If every available source is
+        # degraded, treat the slot as partial rather than missing.
+        non_degraded = [s for s in available if s not in degraded]
+        if not available:
+            return STATUS_NO_DATA, missing, degraded
+        if missing or not non_degraded:
+            base_status = STATUS_PARTIAL_DATA
+            if explicit_outcome in {OUTCOME_HARD_FAIL, OUTCOME_NEUTRAL}:
+                return _status_from_outcome(explicit_outcome), missing, degraded
+            return base_status, missing, degraded
+    elif missing:
+        return STATUS_NO_DATA, missing, degraded
+
+    if explicit_outcome is not None:
+        status = _status_from_outcome(explicit_outcome)
+        if degraded and status == STATUS_PASS:
+            status = STATUS_PARTIAL_DATA
+        return status, missing, degraded
+
+    base_status = STATUS_PASS if sub.passes else STATUS_FAIL
+    if degraded and base_status == STATUS_PASS:
+        base_status = STATUS_PARTIAL_DATA
+    return base_status, missing, degraded
 
 
 def _subcheck_evidence(
@@ -365,16 +500,20 @@ def _subcheck_evidence(
     coverage: dict[str, Any] | None,
 ) -> dict[str, Any]:
     spec = _SUBCHECK_SPECS.get(key, {"label": sub.name, "required_sources": []})
-    status, missing = _derive_subcheck_status(sub=sub, spec=spec, coverage=coverage)
+    status, missing, degraded = _derive_subcheck_status(
+        sub=sub, spec=spec, coverage=coverage,
+    )
     out: dict[str, Any] = {
         "label": spec.get("label", sub.name),
         "status": status,
+        "outcome": sub.resolved_outcome,
         "passes": bool(sub.passes),
         "score": (None if sub.score is None else float(sub.score)),
         "rationale": sub.rationale,
         "evidence": dict(sub.details or {}),
         "required_sources": list(spec.get("required_sources", [])),
         "missing_sources": missing,
+        "degraded_sources": degraded,
     }
     if status == STATUS_ERROR:
         out["error_type"] = sub.details.get("exception_type")
@@ -382,10 +521,19 @@ def _subcheck_evidence(
 
 
 def _coverage_to_dict(coverage: SourceCoverage | None) -> dict[str, Any] | None:
-    """Convert ``SourceCoverage`` (or ``None``) to a plain JSON dict."""
+    """Convert ``SourceCoverage`` (or ``None``) to a plain JSON dict.
+
+    The shareholder_letter slot grows a ``quality`` field
+    (``"real" | "degraded" | "missing"``) so the dashboard does not have
+    to re-derive provenance semantics. ``available=true`` plus
+    ``quality="degraded"`` means: we have *some* letter text, but it is
+    Item 1 or annual-report container material, not a CEO-to-shareholder
+    letter — LongShort / Clarity will mark themselves ``partial_data``
+    even when the LLM signal is positive.
+    """
     if coverage is None:
         return None
-    return {
+    out = {
         "transcripts": {
             "available": coverage.transcripts_available,
             "count": int(coverage.transcripts_count),
@@ -404,6 +552,8 @@ def _coverage_to_dict(coverage: SourceCoverage | None) -> dict[str, Any] | None:
         },
         "source_documents": coverage.source_documents,
     }
+    out["shareholder_letter"]["quality"] = _shareholder_letter_quality(out)
+    return out
 
 
 def _empty_management_evidence(
@@ -412,7 +562,7 @@ def _empty_management_evidence(
     reason: str | None = None,
 ) -> dict[str, Any]:
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
         "as_of": None,
         "fiscal_year": None,
         "model": fm.model if fm is not None else "",
@@ -420,7 +570,36 @@ def _empty_management_evidence(
         "bundle_hash": None,
         "source_coverage": None,
         "subchecks": {},
+        "decision": {
+            "outcome": "no_data",
+            "hard_failures": [],
+            "clean_passes": [],
+            "neutral_subchecks": [],
+            "partial_subchecks": [],
+            "no_data_subchecks": [],
+            "error_subchecks": [],
+            "usable_evidence_count": 0,
+            "total_subchecks": 0,
+            "rationale": reason or "Management pipeline did not run.",
+        },
         "reason": reason,
+    }
+
+
+def _decision_to_dict(management: ManagementResult) -> dict[str, Any]:
+    """Serialize the aggregate ``ManagementDecision`` into JSON shape."""
+    d = management.decision()
+    return {
+        "outcome": d.outcome,
+        "hard_failures": list(d.hard_failures),
+        "clean_passes": list(d.clean_passes),
+        "neutral_subchecks": list(d.neutral_subchecks),
+        "partial_subchecks": list(d.partial_subchecks),
+        "no_data_subchecks": list(d.no_data_subchecks),
+        "error_subchecks": list(d.error_subchecks),
+        "usable_evidence_count": int(d.usable_evidence_count),
+        "total_subchecks": int(d.total_subchecks),
+        "rationale": d.rationale,
     }
 
 
@@ -472,7 +651,7 @@ def build_management_evidence(
         )
 
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
         "as_of": management.as_of.isoformat() if management.as_of else None,
         "fiscal_year": management.fiscal_year,
         "model": management.model,
@@ -480,6 +659,7 @@ def build_management_evidence(
         "bundle_hash": management.bundle_hash,
         "source_coverage": coverage_dict,
         "subchecks": subchecks,
+        "decision": _decision_to_dict(management),
     }
 
 
@@ -489,6 +669,7 @@ __all__ = [
     "STATUS_FAIL",
     "STATUS_NO_DATA",
     "STATUS_PARTIAL_DATA",
+    "STATUS_NEUTRAL",
     "STATUS_ERROR",
     "build_big_five_evidence",
     "build_management_evidence",

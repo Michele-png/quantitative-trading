@@ -115,6 +115,13 @@ class ScreenedRecord:
     screen_passes: bool
     failed_gates: list[str] = field(default_factory=list)
 
+    # Aggregate Management decision (v2 evidence). Surfaces the new
+    # ``ManagementDecision.outcome`` as a flat column so the dashboard
+    # can render a single "Mgmt: PASS / NEUTRAL / HARD_FAIL / NO_DATA"
+    # headline without parsing ``management_evidence``. ``None`` when
+    # the management pipeline didn't run.
+    mgmt_decision_outcome: str | None = None
+
     # Margin of Safety — only filled by ``refresh_records``
     sticker_price: float | None = None
     margin_of_safety_price: float | None = None

@@ -225,7 +225,9 @@ class TestManagementEvidence:
             management=_make_management(coverage=_full_coverage()),
             four_ms=_stub_four_ms(),
         )
-        assert ev["schema_version"] == 1
+        # Management evidence schema bumped to v2 when the explicit
+        # ``outcome`` field and aggregate ``decision`` block shipped.
+        assert ev["schema_version"] == 2
         for key in ("blame", "long_short", "clarity",
                     "compensation", "insider"):
             assert ev["subchecks"][key]["status"] == STATUS_PASS
@@ -234,6 +236,12 @@ class TestManagementEvidence:
         assert cov["transcripts"]["available"] is True
         assert cov["transcripts"]["count"] == 8
         assert cov["form4"]["available"] is True
+        # Real DEF 14A letter source → ``quality="real"``; the dashboard
+        # uses this to avoid down-grading LongShort / Clarity.
+        assert cov["shareholder_letter"]["quality"] == "real"
+        # Aggregate decision block accompanies every fresh evidence blob.
+        assert ev["decision"]["outcome"] == "pass"
+        assert ev["decision"]["usable_evidence_count"] >= 3
 
     def test_no_transcripts_marks_blame_no_data(self) -> None:
         coverage = _full_coverage(transcripts=0)
@@ -321,3 +329,70 @@ class TestManagementEvidence:
         assert ev["subchecks"] == {}
         assert ev["source_coverage"] is None
         assert "did not run" in ev["reason"]
+        # Stub still carries an aggregate decision block so the
+        # dashboard never has to guess: explicit ``no_data``.
+        assert ev["decision"]["outcome"] == "no_data"
+
+
+class TestManagementEvidenceFallbackLetter:
+    """The shareholder-letter slot must surface fallback provenance so the
+    dashboard's LongShort / Clarity downgrade behaviour is consistent."""
+
+    def _fallback_coverage(self, *, source: str) -> SourceCoverage:
+        return SourceCoverage(
+            transcripts_available=True, transcripts_count=8,
+            transcripts_expected=8,
+            def14a_compensation_available=True,
+            def14a_letter_available=False,
+            shareholder_letter_available=True,
+            shareholder_letter_source=source,
+            mda_available=True,
+            form4_available=True, form4_n_transactions=4,
+        )
+
+    def test_item1_fallback_letter_marks_long_short_partial(self) -> None:
+        """Item 1 fallback in the shareholder-letter slot must downgrade
+        LongShort to ``partial_data`` even when the underlying signal
+        passes — Item 1 is regulatory product copy, not a CEO letter."""
+        coverage = self._fallback_coverage(
+            source="10-k_item1_fallback_business_description",
+        )
+        ev = build_management_evidence(
+            management=_make_management(
+                coverage=coverage, long_short_passes=True,
+            ),
+            four_ms=_stub_four_ms(),
+        )
+        assert ev["source_coverage"]["shareholder_letter"]["quality"] == "degraded"
+        ls = ev["subchecks"]["long_short"]
+        assert ls["status"] == STATUS_PARTIAL_DATA
+        assert "shareholder_letter" in ls["degraded_sources"]
+
+    def test_annual_report_archive_marks_clarity_partial(self) -> None:
+        """An archived ``annual_report`` filling the shareholder-letter
+        slot must also be treated as degraded — the annual report is a
+        container, not a real CEO letter section."""
+        coverage = self._fallback_coverage(source="archive:annual_report")
+        ev = build_management_evidence(
+            management=_make_management(
+                coverage=coverage, clarity_passes=True,
+            ),
+            four_ms=_stub_four_ms(),
+        )
+        assert ev["source_coverage"]["shareholder_letter"]["quality"] == "degraded"
+        clarity = ev["subchecks"]["clarity"]
+        assert clarity["status"] == STATUS_PARTIAL_DATA
+        assert "shareholder_letter" in clarity["degraded_sources"]
+
+    def test_real_def14a_letter_keeps_clean_pass(self) -> None:
+        """A genuine DEF 14A letter must not be downgraded — the
+        ``quality`` tag stays ``real`` and the sub-check passes cleanly."""
+        coverage = self._fallback_coverage(source="def14a")
+        ev = build_management_evidence(
+            management=_make_management(
+                coverage=coverage, long_short_passes=True,
+            ),
+            four_ms=_stub_four_ms(),
+        )
+        assert ev["source_coverage"]["shareholder_letter"]["quality"] == "real"
+        assert ev["subchecks"]["long_short"]["status"] == STATUS_PASS

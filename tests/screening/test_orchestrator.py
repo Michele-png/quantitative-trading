@@ -330,10 +330,15 @@ def test_record_populates_evidence_blobs() -> None:
         assert check["status"] in {"pass", "fail", "no_data", "error"}
         assert "yearly" in check
 
-    assert rec.management_evidence["schema_version"] == 1
+    # Management evidence schema bumped to v2 when the explicit
+    # ``outcome`` field per sub-check and the aggregate ``decision``
+    # block shipped. The Big 5 evidence schema is independent and
+    # remains at v1.
+    assert rec.management_evidence["schema_version"] == 2
     assert set(rec.management_evidence["subchecks"].keys()) == {
         "blame", "long_short", "clarity", "compensation", "insider",
     }
+    assert rec.management_evidence["decision"]["outcome"] == "pass"
 
 
 def test_error_record_still_carries_evidence_stub() -> None:
@@ -346,5 +351,137 @@ def test_error_record_still_carries_evidence_stub() -> None:
     # Evidence blobs are present but empty so the dashboard never NPEs.
     assert rec.big_five_evidence["schema_version"] == 1
     assert rec.big_five_evidence["checks"] == {}
-    assert rec.management_evidence["schema_version"] == 1
+    assert rec.management_evidence["schema_version"] == 2
     assert rec.management_evidence["subchecks"] == {}
+    # Aggregate decision stub explicitly reports ``no_data`` when the
+    # management pipeline never ran — never an accidental ``pass``.
+    assert rec.management_evidence["decision"]["outcome"] == "no_data"
+
+
+# --------------------------------------------------------------------------
+# Regression: aggregate Management policy at the orchestrator boundary
+# --------------------------------------------------------------------------
+#
+# Pins the new "no_data never passes, hard_fail still fails, neutral legs
+# do not silently flip the pillar to fail" semantics at the orchestrator
+# boundary so future refactors of the aggregate cannot regress the
+# headline pass/fail surfaced to the dashboard.
+
+
+def _make_management_with_outcomes(
+    *,
+    blame: tuple[bool, str] = (True, "pass"),
+    long_short: tuple[bool, str] = (True, "pass"),
+    clarity: tuple[bool, str] = (True, "pass"),
+    compensation: tuple[bool, str] = (True, "pass"),
+    insider: tuple[bool, str] = (True, "pass"),
+    capital_allocation: tuple[bool, str] | None = (True, "pass"),
+) -> ManagementResult:
+    def _sc(name: str, pair: tuple[bool, str]) -> SubCheck:
+        passes, outcome = pair
+        return SubCheck(
+            name=name, passes=passes, score=None, rationale=name,
+            outcome=outcome,  # type: ignore[arg-type]
+        )
+
+    cap = _sc("CapitalAllocation", capital_allocation) if capital_allocation else None
+    return ManagementResult(
+        ticker="FAKE", as_of=date(2024, 1, 1), fiscal_year=2023,
+        bundle_hash="abc", model="claude-opus-4-7", cached=False,
+        blame=_sc("Blame", blame),
+        long_short=_sc("LongShort", long_short),
+        clarity=_sc("Clarity", clarity),
+        compensation=_sc("Compensation", compensation),
+        insider=_sc("Insider", insider),
+        capital_allocation=cap,
+    )
+
+
+def _agent_result_with_management(mgmt: ManagementResult) -> AgentResult:
+    base = _agent_result()
+    return AgentResult(
+        ticker=base.ticker,
+        as_of=base.as_of,
+        big_five=base.big_five,
+        sticker=base.sticker,
+        payback=base.payback,
+        four_ms=base.four_ms,
+        management=mgmt,
+        quant_extras=base.quant_extras,
+    )
+
+
+def test_orchestrator_does_not_pass_when_all_management_legs_are_no_data() -> None:
+    """All-missing Management evidence must fail the gate, never silently
+    pass. This is the central guarantee the new aggregate rule preserves."""
+    mgmt = _make_management_with_outcomes(
+        blame=(False, "no_data"),
+        long_short=(False, "no_data"),
+        clarity=(False, "no_data"),
+        compensation=(False, "no_data"),
+        insider=(False, "no_data"),
+        capital_allocation=(False, "no_data"),
+    )
+    agent = MagicMock()
+    agent.evaluate.return_value = _agent_result_with_management(mgmt)
+    rec = ScreeningOrchestrator(agent=agent).screen(
+        ["FAKE"], date(2024, 1, 1)
+    )[0]
+    assert not rec.screen_passes
+    assert "management" in rec.failed_gates
+    assert rec.mgmt_decision_outcome == "no_data"
+
+
+def test_orchestrator_passes_with_clean_majority_and_some_neutral() -> None:
+    """4 clean passes + 2 neutral (the canonical mega-cap shape) must
+    pass the Management gate. Under the legacy strict AND this would
+    have failed because of the two neutral legs."""
+    mgmt = _make_management_with_outcomes(
+        blame=(True, "pass"),
+        long_short=(False, "neutral"),
+        clarity=(True, "pass"),
+        compensation=(True, "pass"),
+        insider=(False, "neutral"),
+        capital_allocation=(True, "pass"),
+    )
+    agent = MagicMock()
+    agent.evaluate.return_value = _agent_result_with_management(mgmt)
+    rec = ScreeningOrchestrator(agent=agent).screen(
+        ["FAKE"], date(2024, 1, 1)
+    )[0]
+    assert rec.screen_passes
+    assert "management" not in rec.failed_gates
+    assert rec.mgmt_decision_outcome == "pass"
+
+
+def test_orchestrator_fails_on_management_hard_fail() -> None:
+    """A genuine hard_fail sub-check still fails the Management gate
+    even when everything else passes — the new aggregate does not soften
+    real red flags."""
+    mgmt = _make_management_with_outcomes(
+        blame=(True, "pass"),
+        long_short=(True, "pass"),
+        clarity=(True, "pass"),
+        compensation=(False, "hard_fail"),
+        insider=(True, "pass"),
+        capital_allocation=(True, "pass"),
+    )
+    agent = MagicMock()
+    agent.evaluate.return_value = _agent_result_with_management(mgmt)
+    rec = ScreeningOrchestrator(agent=agent).screen(
+        ["FAKE"], date(2024, 1, 1)
+    )[0]
+    assert not rec.screen_passes
+    assert "management" in rec.failed_gates
+    assert rec.mgmt_decision_outcome == "hard_fail"
+
+
+def test_orchestrator_persists_mgmt_decision_outcome_column() -> None:
+    """The flat ``mgmt_decision_outcome`` column is the dashboard's
+    cheap headline. Confirm orchestrator-built records carry it."""
+    agent = MagicMock()
+    agent.evaluate.return_value = _agent_result()
+    rec = ScreeningOrchestrator(agent=agent).screen(
+        ["FAKE"], date(2024, 1, 1)
+    )[0]
+    assert rec.mgmt_decision_outcome == "pass"

@@ -197,14 +197,17 @@ def test_summarize_fails_on_zero_net_activity_no_buys() -> None:
     assert "≥ $25k" in res.rationale
 
 
-def test_summarize_fails_below_min_net_buy_threshold() -> None:
-    """$8k of buying is not enough to call the alignment check a PASS."""
+def test_summarize_below_min_net_buy_threshold_is_neutral() -> None:
+    """$8k of buying is not enough to call the alignment check a PASS —
+    under the tri-state outcome it is NEUTRAL (insufficient positive
+    signal), not a hard fail."""
     txns = [
         _txn(name="CEO", code="P", shares=160, price=50, on=date(2024, 1, 10)),  # $8k
     ]
     res = summarize_insider_alignment(txns, as_of=date(2024, 6, 1))
     assert res.net_open_market_value_usd == pytest.approx(8_000.0)
     assert not res.passes
+    assert res.outcome == "neutral"
 
 
 def test_summarize_passes_at_threshold_buying() -> None:
@@ -215,20 +218,26 @@ def test_summarize_passes_at_threshold_buying() -> None:
     res = summarize_insider_alignment(txns, as_of=date(2024, 6, 1))
     assert res.net_open_market_value_usd == pytest.approx(25_000.0)
     assert res.passes
+    assert res.outcome == "pass"
 
 
-def test_summarize_fails_on_large_recent_non_plan_sells() -> None:
+def test_summarize_hard_fails_on_large_recent_non_plan_sells() -> None:
+    """Large recent non-plan selling is the genuine negative alignment
+    signal — under the tri-state outcome it must be ``hard_fail``."""
     txns = [
         _txn(name="CEO", code="S", shares=100_000, price=50, on=date(2024, 5, 15)),
     ]
     res = summarize_insider_alignment(txns, as_of=date(2024, 6, 1))
     assert not res.passes
     assert res.has_large_recent_sells
+    assert res.outcome == "hard_fail"
 
 
 def test_summarize_ignores_taxes_and_grants_and_gifts() -> None:
-    """Non-economic codes don't count as buying — and without real buys
-    the alignment check fails (rather than passing on $0 net)."""
+    """Non-economic codes don't count as buying. Without real buys and
+    without large non-plan selling the alignment check is NEUTRAL —
+    stock-comp executives with only tax/grant/gift activity should not
+    silently fail the Management pillar."""
     txns = [
         _txn(name="CEO", code="A", shares=10_000, price=50, on=date(2024, 1, 10)),  # award
         _txn(name="CEO", code="F", shares=2_000, price=50, on=date(2024, 1, 11)),  # tax
@@ -239,11 +248,13 @@ def test_summarize_ignores_taxes_and_grants_and_gifts() -> None:
     assert res.open_market_buy_value_usd == 0
     assert res.open_market_sell_value_usd == 0
     assert not res.passes
+    assert res.outcome == "neutral"
 
 
 def test_summarize_window_excludes_old_transactions() -> None:
-    """Transactions outside the window are dropped — and an empty window
-    fails for lack of qualifying insider buying."""
+    """Transactions outside the window are dropped — and an empty
+    window is NEUTRAL (absence of activity is not a positive signal but
+    also not a red flag for stock-comp-paid executives)."""
     txns = [
         _txn(name="CEO", code="S", shares=200_000, price=50, on=date(2018, 1, 1)),
     ]
@@ -252,7 +263,8 @@ def test_summarize_window_excludes_old_transactions() -> None:
     )
     assert res.n_transactions == 0
     assert not res.passes
-    assert "absence of selling is not a positive signal" in res.rationale
+    assert res.outcome == "neutral"
+    assert "NEUTRAL" in res.rationale
 
 
 # --------------------------------------------------------------------------

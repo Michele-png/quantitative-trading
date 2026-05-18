@@ -81,7 +81,12 @@ def _failed_gates(result: AgentResult, policy: HardGatePolicy) -> list[str]:
     if policy.require_moat and not llm.get("moat", False):
         failed.append("moat")
     # Management uses the dedicated ManagementResult aggregator when
-    # available so partial 4Ms failures don't poison the gate.
+    # available so partial 4Ms failures don't poison the gate. With the
+    # v3 prompt + v2 evidence schema the aggregate uses the
+    # ``ManagementDecision`` (hard_fail / no_data / neutral / pass),
+    # not the legacy strict AND. ``ManagementResult.passes`` already
+    # delegates to the new decision, so the orchestrator keeps a
+    # single source of truth without re-implementing the rule.
     if policy.require_management:
         mgmt_passes = (
             result.management.passes
@@ -204,6 +209,10 @@ def _record_from_result(
 
         screen_passes=screen_passes,
         failed_gates=failed,
+
+        mgmt_decision_outcome=(
+            mg.decision().outcome if mg is not None else None
+        ),
 
         sticker_price=sp.sticker_price if include_mos else None,
         margin_of_safety_price=sp.margin_of_safety_price if include_mos else None,
