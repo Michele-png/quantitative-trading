@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from quantitative_trading.data.management_documents import (
+from value_investing_backend.data.management_documents import (
     ArchiveBackedManagementProvider,
     DeterministicDiscoverer,
     DocumentCandidate,

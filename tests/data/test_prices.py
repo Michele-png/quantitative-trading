@@ -18,8 +18,8 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
-from quantitative_trading.config import get_config
-from quantitative_trading.data.prices import PriceClient
+from value_investing_backend.config import get_config
+from value_investing_backend.data.prices import PriceClient
 
 
 def _synthetic_history() -> pd.DataFrame:

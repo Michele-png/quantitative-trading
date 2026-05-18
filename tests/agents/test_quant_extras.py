@@ -8,16 +8,16 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from quantitative_trading.agents.rule_one.big_five import (
+from value_investing_backend.agents.rule_one.big_five import (
     BigFiveResult,
     MetricResult,
 )
-from quantitative_trading.agents.rule_one.quant_extras import (
+from value_investing_backend.agents.rule_one.quant_extras import (
     DEBT_PAYOFF_THRESHOLD_YEARS,
     DILUTION_YELLOW_MAX,
     QuantExtrasAnalyzer,
 )
-from quantitative_trading.config import get_config
+from value_investing_backend.config import get_config
 
 
 @pytest.fixture(autouse=True)

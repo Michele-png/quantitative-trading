@@ -16,8 +16,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from quantitative_trading.config import get_config
-from quantitative_trading.data.edgar import (
+from value_investing_backend.config import get_config
+from value_investing_backend.data.edgar import (
     EdgarClient,
     EdgarError,
     _normalize_ticker_for_sec,

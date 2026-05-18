@@ -4,17 +4,17 @@ from __future__ import annotations
 
 from datetime import date
 
-from quantitative_trading.agents.rule_one.big_five import (
+from value_investing_backend.agents.rule_one.big_five import (
     BigFiveResult,
     MetricResult,
 )
-from quantitative_trading.agents.rule_one.four_ms_llm import FourMsResult, MCheck
-from quantitative_trading.agents.rule_one.management_llm import (
+from value_investing_backend.agents.rule_one.four_ms_llm import FourMsResult, MCheck
+from value_investing_backend.agents.rule_one.management_llm import (
     ManagementResult,
     SourceCoverage,
     SubCheck,
 )
-from quantitative_trading.screening.evidence import (
+from value_investing_backend.screening.evidence import (
     STATUS_ERROR,
     STATUS_FAIL,
     STATUS_NO_DATA,
@@ -23,7 +23,6 @@ from quantitative_trading.screening.evidence import (
     build_big_five_evidence,
     build_management_evidence,
 )
-
 
 # --------------------------------------------------------------------------
 # Builders

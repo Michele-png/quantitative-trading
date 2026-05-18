@@ -8,34 +8,34 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from quantitative_trading.agents.rule_one.agent import AgentResult
-from quantitative_trading.agents.rule_one.big_five import (
+from value_investing_backend.agents.rule_one.agent import AgentResult
+from value_investing_backend.agents.rule_one.big_five import (
     BigFiveResult,
     MetricResult,
 )
-from quantitative_trading.agents.rule_one.four_ms_llm import (
+from value_investing_backend.agents.rule_one.four_ms_llm import (
     FourMsResult,
     MCheck,
 )
-from quantitative_trading.agents.rule_one.management_llm import (
+from value_investing_backend.agents.rule_one.management_llm import (
     ManagementResult,
     SubCheck,
 )
-from quantitative_trading.agents.rule_one.quant_extras import (
+from value_investing_backend.agents.rule_one.quant_extras import (
     DividendQualityDetails,
     QuantExtrasResult,
 )
-from quantitative_trading.agents.rule_one.sticker_price import (
+from value_investing_backend.agents.rule_one.sticker_price import (
     PaybackTimeResult,
     StickerPriceResult,
 )
-from quantitative_trading.config import get_config
-from quantitative_trading.screening.orchestrator import (
+from value_investing_backend.config import get_config
+from value_investing_backend.screening.orchestrator import (
     ScreeningOrchestrator,
     refresh_records,
     screen_tickers,
 )
-from quantitative_trading.screening.records import HardGatePolicy
+from value_investing_backend.screening.records import HardGatePolicy
 
 
 @pytest.fixture(autouse=True)

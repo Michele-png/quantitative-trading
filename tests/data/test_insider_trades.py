@@ -8,8 +8,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from quantitative_trading.config import get_config
-from quantitative_trading.data.insider_trades import (
+from value_investing_backend.config import get_config
+from value_investing_backend.data.insider_trades import (
     InsiderTransaction,
     fetch_insider_history,
     parse_form4_xml,

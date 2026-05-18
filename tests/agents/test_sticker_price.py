@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from quantitative_trading.agents.rule_one.sticker_price import (
+from value_investing_backend.agents.rule_one.sticker_price import (
     DEFAULT_FGR_CAP,
     DEFAULT_FUTURE_PE_CAP,
     DEFAULT_REQUIRED_RETURN,
@@ -21,7 +21,6 @@ from quantitative_trading.agents.rule_one.sticker_price import (
     compute_sticker_price,
     compute_sticker_sensitivity,
 )
-
 
 # --------------------------------------------------------------------------
 # compute_sticker_price — pure-math tests

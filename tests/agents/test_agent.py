@@ -8,20 +8,20 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from quantitative_trading.agents.rule_one.agent import AgentResult, RuleOneAgent
-from quantitative_trading.agents.rule_one.big_five import (
+from value_investing_backend.agents.rule_one.agent import AgentResult, RuleOneAgent
+from value_investing_backend.agents.rule_one.big_five import (
     BigFiveResult,
     MetricResult,
 )
-from quantitative_trading.agents.rule_one.four_ms_llm import (
+from value_investing_backend.agents.rule_one.four_ms_llm import (
     FourMsResult,
     MCheck,
 )
-from quantitative_trading.agents.rule_one.sticker_price import (
+from value_investing_backend.agents.rule_one.sticker_price import (
     PaybackTimeResult,
     StickerPriceResult,
 )
-from quantitative_trading.config import get_config
+from value_investing_backend.config import get_config
 
 
 @pytest.fixture(autouse=True)
@@ -200,11 +200,11 @@ def test_evaluate_skips_llm_when_include_llm_false() -> None:
     anthropic = MagicMock()
 
     with patch(
-        "quantitative_trading.agents.rule_one.agent.BigFiveAnalyzer"
+        "value_investing_backend.agents.rule_one.agent.BigFiveAnalyzer"
     ) as MockB5, patch(
-        "quantitative_trading.agents.rule_one.agent.StickerPriceCalculator"
+        "value_investing_backend.agents.rule_one.agent.StickerPriceCalculator"
     ) as MockSP, patch(
-        "quantitative_trading.agents.rule_one.agent.FourMsAnalyzer"
+        "value_investing_backend.agents.rule_one.agent.FourMsAnalyzer"
     ) as MockFM:
         MockB5.return_value.evaluate.return_value = _make_big_five(True)
         MockSP.return_value.evaluate.return_value = (
@@ -223,11 +223,11 @@ def test_evaluate_runs_llm_when_include_llm_true() -> None:
     anthropic = MagicMock()
 
     with patch(
-        "quantitative_trading.agents.rule_one.agent.BigFiveAnalyzer"
+        "value_investing_backend.agents.rule_one.agent.BigFiveAnalyzer"
     ) as MockB5, patch(
-        "quantitative_trading.agents.rule_one.agent.StickerPriceCalculator"
+        "value_investing_backend.agents.rule_one.agent.StickerPriceCalculator"
     ) as MockSP, patch(
-        "quantitative_trading.agents.rule_one.agent.FourMsAnalyzer"
+        "value_investing_backend.agents.rule_one.agent.FourMsAnalyzer"
     ) as MockFM:
         MockB5.return_value.evaluate.return_value = _make_big_five(True)
         MockSP.return_value.evaluate.return_value = (

@@ -12,10 +12,9 @@ from __future__ import annotations
 import sys
 from datetime import date
 
-from quantitative_trading.config import init_env
-from quantitative_trading.data.edgar import EdgarClient
-from quantitative_trading.data.pit_facts import PointInTimeFacts
-
+from value_investing_backend.config import init_env
+from value_investing_backend.data.edgar import EdgarClient
+from value_investing_backend.data.pit_facts import PointInTimeFacts
 
 CASES: list[tuple[str, int, date, dict[str, float], str]] = [
     (

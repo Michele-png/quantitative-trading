@@ -9,8 +9,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from quantitative_trading.agents.rule_one.llm_client import LlmCallResult, LlmClient
-from quantitative_trading.agents.rule_one.management_llm import (
+from value_investing_backend.agents.rule_one.llm_client import LlmCallResult, LlmClient
+from value_investing_backend.agents.rule_one.management_llm import (
     PROMPT_VERSION,
     BlameEvaluator,
     CapitalAllocationContext,
@@ -26,12 +26,12 @@ from quantitative_trading.agents.rule_one.management_llm import (
     _cache_key,
     _encode_subcheck,
 )
-from quantitative_trading.config import get_config
-from quantitative_trading.data.management_documents import (
+from value_investing_backend.config import get_config
+from value_investing_backend.data.management_documents import (
     ArchiveBackedManagementProvider,
     ArchivedManagementDocument,
 )
-from quantitative_trading.data.transcripts import EarningsTranscript
+from value_investing_backend.data.transcripts import EarningsTranscript
 
 
 @pytest.fixture(autouse=True)
@@ -609,7 +609,7 @@ def test_document_bundler_prefers_archive_documents(monkeypatch: pytest.MonkeyPa
     edgar.get_company_facts.return_value = {}
     edgar.list_filings.return_value = []
     monkeypatch.setattr(
-        "quantitative_trading.agents.rule_one.management_llm.find_pit_10k",
+        "value_investing_backend.agents.rule_one.management_llm.find_pit_10k",
         lambda *args, **kwargs: None,
     )
 

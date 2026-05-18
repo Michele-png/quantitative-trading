@@ -7,9 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from quantitative_trading.config import get_config
-from quantitative_trading.data.universe import SP500Universe
-
+from value_investing_backend.config import get_config
+from value_investing_backend.data.universe import SP500Universe
 
 _FIXTURE_CSV = """ticker,start_date,end_date
 AAPL,1996-01-02,

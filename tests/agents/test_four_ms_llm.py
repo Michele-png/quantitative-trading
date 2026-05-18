@@ -14,14 +14,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from quantitative_trading.agents.rule_one.four_ms_llm import (
+from value_investing_backend.agents.rule_one.four_ms_llm import (
     FourMsAnalyzer,
     _coerce_to_dict,
     extract_10k_sections,
     find_pit_10k,
     html_to_text,
 )
-from quantitative_trading.config import get_config
+from value_investing_backend.config import get_config
 
 
 def _wire_stream(anthropic: MagicMock, response: MagicMock) -> None:

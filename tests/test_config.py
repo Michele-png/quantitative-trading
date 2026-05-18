@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from quantitative_trading.config import ConfigError, get_config
+from value_investing_backend.config import ConfigError, get_config
 
 
 @pytest.fixture(autouse=True)
@@ -126,7 +126,7 @@ def test_thinking_budget_overridden_by_env(
 def test_invalid_thinking_budget_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    from quantitative_trading.config import ConfigError
+    from value_investing_backend.config import ConfigError
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     monkeypatch.setenv("SEC_USER_AGENT", "Test User test@example.com")

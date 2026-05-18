@@ -11,7 +11,7 @@ from datetime import date
 
 import pytest
 
-from quantitative_trading.data.pit_facts import PointInTimeFacts
+from value_investing_backend.data.pit_facts import PointInTimeFacts
 
 
 def _flow(

@@ -66,7 +66,7 @@ dmypy.json
 chats/
 
 # Project data caches — large, regenerable, should never be committed
-# (anchored to top-level /data/ only; src/quantitative_trading/data/ and
+# (anchored to top-level /data/ only; src/value_investing_backend/data/ and
 #  tests/data/ are source code and MUST be tracked)
 /data/
 !/data/.gitkeep

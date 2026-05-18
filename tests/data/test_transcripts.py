@@ -9,8 +9,8 @@ from unittest.mock import MagicMock
 import pytest
 import requests
 
-from quantitative_trading.config import get_config
-from quantitative_trading.data.transcripts import (
+from value_investing_backend.config import get_config
+from value_investing_backend.data.transcripts import (
     DefaultTranscriptProvider,
     EarningsTranscript,
     FmpTranscriptProvider,

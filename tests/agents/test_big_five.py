@@ -13,14 +13,14 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-from quantitative_trading.agents.rule_one.big_five import (
+from value_investing_backend.agents.rule_one.big_five import (
     DEFAULT_THRESHOLD,
     BigFiveAnalyzer,
     _adjust_eps_for_splits,
     _cagr,
 )
-from quantitative_trading.config import get_config
-from quantitative_trading.data.pit_facts import FactValue
+from value_investing_backend.config import get_config
+from value_investing_backend.data.pit_facts import FactValue
 
 
 @pytest.fixture(autouse=True)
@@ -390,7 +390,7 @@ def test_eps_marked_unavailable_when_no_source_has_data(
     analyzer = _make_analyzer_with_facts(facts, monkeypatch)
     # Stub the yfinance fallback — tests must never hit the network.
     monkeypatch.setattr(
-        "quantitative_trading.agents.rule_one.big_five._yfinance_eps_series",
+        "value_investing_backend.agents.rule_one.big_five._yfinance_eps_series",
         lambda *args, **kwargs: {},
     )
     result = analyzer.evaluate("FAKE", as_of=date(2025, 6, 1), n_years=10)

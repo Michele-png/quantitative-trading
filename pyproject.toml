@@ -1,7 +1,7 @@
 [project]
-name = "quantitative-trading"
+name = "value-investing-backend"
 version = "0.1.0"
-description = "Rule One value-investing agent (LLM-driven qualitative + code-driven quantitative) with point-in-time historical backtesting on SEC EDGAR + yfinance."
+description = "Rule One value-investing agent (LLM-driven qualitative + code-driven quantitative): the production library called by the value-investing-dashboard ETL. Point-in-time SEC EDGAR + yfinance data layer + screening API."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -10,19 +10,15 @@ authors = [{ name = "Michele Scalzotto" }]
 dependencies = [
     "anthropic>=0.40.0",
     "beautifulsoup4>=4.12.0",
-    "lifelines>=0.28.0",
     "lxml>=5.0.0",
     "numpy>=1.26.0",
     "pandas>=2.2.0",
+    # Used by pandas.to_parquet() in data/prices.py for the daily-history cache.
     "pyarrow>=15.0.0",
-    "pydantic>=2.6.0",
     "pypdf>=4.0.0",
     "python-dotenv>=1.0.0",
     "requests>=2.31.0",
-    "scipy>=1.13.0",
-    "statsmodels>=0.14.0",
     "tenacity>=8.2.0",
-    "tqdm>=4.66.0",
     "yfinance>=0.2.40",
 ]
 
@@ -45,7 +41,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/quantitative_trading"]
+packages = ["src/value_investing_backend"]
 
 [tool.ruff]
 line-length = 100
