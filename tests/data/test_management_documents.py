@@ -20,6 +20,7 @@ from value_investing_backend.data.management_documents import (
     IRSourcesConfig,
     LocalManagementDocumentArchive,
     ManagementDocumentFetcher,
+    SupabaseManagementDocumentStore,
     _bytes_to_text,
     _identity_in_text,
 )
@@ -137,6 +138,46 @@ def test_fetcher_hashes_and_rejects_too_short_content() -> None:
     assert not doc.validation.passed
     assert doc.retrieval_status == "rejected"
     assert "below shareholder_letter floor" in doc.validation.notes[0]
+
+
+def test_supabase_store_treats_duplicate_storage_upload_as_idempotent() -> None:
+    session = MagicMock()
+    response = MagicMock()
+    response.status_code = 400
+    response.json.return_value = {
+        "statusCode": "23505",
+        "error": "Duplicate",
+        "message": "The resource already exists",
+    }
+    response.text = "The resource already exists"
+    session.post.return_value = response
+    store = SupabaseManagementDocumentStore(
+        supabase_url="https://example.supabase.co",
+        service_role_key="service-role",
+        session=session,
+    )
+
+    store._upload("MSFT/proxy_letter/doc.html", b"<html></html>", "text/html")
+
+    response.raise_for_status.assert_not_called()
+
+
+def test_supabase_store_raises_for_non_duplicate_storage_upload_error() -> None:
+    session = MagicMock()
+    response = MagicMock()
+    response.status_code = 400
+    response.json.return_value = {"message": "invalid bucket"}
+    response.text = "invalid bucket"
+    response.raise_for_status.side_effect = RuntimeError("bad request")
+    session.post.return_value = response
+    store = SupabaseManagementDocumentStore(
+        supabase_url="https://example.supabase.co",
+        service_role_key="service-role",
+        session=session,
+    )
+
+    with pytest.raises(RuntimeError, match="bad request"):
+        store._upload("MSFT/proxy_letter/doc.html", b"<html></html>", "text/html")
 
 
 # --------------------------------------------------------------------------

@@ -1083,9 +1083,26 @@ class SupabaseManagementDocumentStore:
             data=raw,
             timeout=self._timeout,
         )
-        if response.status_code == 409:
+        if response.status_code == 409 or self._is_duplicate_upload(response):
             return
         response.raise_for_status()
+
+    @staticmethod
+    def _is_duplicate_upload(response: requests.Response) -> bool:
+        if response.status_code != 400:
+            return False
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        if isinstance(payload, dict):
+            details = " ".join(
+                str(payload.get(key, "")) for key in ("statusCode", "error", "message")
+            ).lower()
+        else:
+            details = ""
+        details = f"{details} {response.text}".lower()
+        return "duplicate" in details or "already exists" in details
 
     def _upsert_metadata(
         self,
